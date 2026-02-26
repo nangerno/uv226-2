@@ -277,30 +277,31 @@ def get_reward_funcs(dataset_type: dict, sample_data, has_extra_column: bool):
     for i, (original_func, func_name, weight) in enumerate(
         zip(reward_funcs_callable, reward_func_names, reward_weights)
     ):
-
-        def create_wrapper(original_func, func_name, weight):
-            supports_extra = supports_extra_data(original_func)
-            print(f"supports_extra: {supports_extra}, has_extra_column: {has_extra_column}")
-            if supports_extra and has_extra_column:
-                print(f"Using extra data for {func_name}")
+        supports_extra = supports_extra_data(original_func)
+        use_extra = supports_extra and has_extra_column
+        print(f"Reward function {func_name}: supports_extra={supports_extra}, has_extra_column={has_extra_column}, using_extra={use_extra}")
+        
+        def create_wrapper(original_func, func_name, weight, use_extra):
+            """Create a wrapper function that applies weight and captures rewards."""
+            def apply_weight_and_capture(raw_results, func_name, weight):
+                """Helper to apply weight and capture rewards."""
+                raw_rewards[func_name].extend(raw_results)
+                weighted_results = [r * weight for r in raw_results]
+                captured_rewards[func_name].extend(weighted_results)
+                return weighted_results
+            
+            if use_extra:
                 def wrapper(completions, extra_data, **kwargs):
                     raw_results = original_func(completions, extra_data=extra_data)
-                    raw_rewards[func_name].extend(raw_results)
-                    weighted_results = [r * weight for r in raw_results]
-                    captured_rewards[func_name].extend(weighted_results)
-                    return weighted_results
+                    return apply_weight_and_capture(raw_results, func_name, weight)
             else:
-                print(f"Not using extra data for {func_name}")
                 def wrapper(completions, **kwargs):
                     raw_results = original_func(completions)
-                    raw_rewards[func_name].extend(raw_results)
-                    weighted_results = [r * weight for r in raw_results]
-                    captured_rewards[func_name].extend(weighted_results)
-                    return weighted_results
-
+                    return apply_weight_and_capture(raw_results, func_name, weight)
+            
             return wrapper
 
-        wrapped_reward_funcs.append(create_wrapper(original_func, func_name, weight))
+        wrapped_reward_funcs.append(create_wrapper(original_func, func_name, weight, use_extra))
 
     return wrapped_reward_funcs
 
@@ -472,7 +473,7 @@ def main():
             end_time=train_request["end_time"],
             checking_mode=train_request.get("checking_mode", "none")
         ),
-        EarlyStoppingCallback(patience=300, min_delta=0.0001)
+        EarlyStoppingCallback(patience=300, min_delta=0.0001, end_time=train_request.get("end_time", ""), max_steps=max_steps)
     ]
     
     # Add progressive batch size callback if enabled

@@ -83,29 +83,37 @@ for key in DPO_CONFIG:
     
 
 def get_config(param_nums: int) -> dict:
+    """
+    Get DPO configuration based on model parameter count.
+    
+    Uses a sorted list of thresholds for efficient lookup.
+    """
+    # Define size thresholds in ascending order (in billions)
+    size_thresholds = [
+        (1, "0_1_b"),
+        (2, "1_2_b"),
+        (4, "2_4_b"),
+        (5, "4_5_b"),
+        (9, "5_9_b"),
+        (12, "9_12_b"),
+        (14, "12_14_b"),
+        (15, "14_15_b"),
+        (35, "15_40_b"),
+        (80, "40_80_b"),
+    ]
+    
+    param_nums_b = param_nums / 1_000_000_000  # Convert to billions
+    
+    # Find appropriate config
     result = None
-    if param_nums < 1_000_000_000:
-        result = DPO_CONFIG["0_1_b"]
-    elif param_nums < 2_000_000_000:
-        result = DPO_CONFIG["1_2_b"]
-    elif param_nums < 4_000_000_000:
-        result = DPO_CONFIG["2_4_b"]
-    elif param_nums < 5_000_000_000:
-        result = DPO_CONFIG["4_5_b"]
-    elif param_nums < 9_000_000_000:
-        result = DPO_CONFIG["5_9_b"]
-    elif param_nums < 12_000_000_000:
-        result = DPO_CONFIG["9_12_b"]
-    elif param_nums < 14_000_000_000:
-        result = DPO_CONFIG["12_14_b"]
-    elif param_nums < 15_000_000_000:  
-        result = DPO_CONFIG["14_15_b"]
-    elif param_nums < 35_000_000_000:
-        result = DPO_CONFIG["15_40_b"]
-    elif param_nums < 80_000_000_000:
-        result = DPO_CONFIG["40_80_b"]
-    else:
-        print(f"Model size {param_nums} is not supported", flush=True)
+    for threshold_b, config_key in size_thresholds:
+        if param_nums_b < threshold_b:
+            result = DPO_CONFIG[config_key].copy()
+            break
+    
+    # Fallback for very large models
+    if result is None:
+        print(f"Model size {param_nums} ({param_nums_b:.1f}B) is not supported, using default config", flush=True)
         result = {
             "lr": 4e-5,
             "distributed": "ds",
@@ -113,10 +121,13 @@ def get_config(param_nums: int) -> dict:
             "batch_size": 6,
             "use_lora": True
         }
-    if param_nums < 4_000_000_000 and param_nums > 1_330_000_000:
+    
+    # Apply GPU count overrides based on specific size ranges
+    if 1.33 < param_nums_b < 4.0:
         result["gpu_count"] = 2
-    if param_nums > 13_330_000_000: # 8 GPUs for 13.3B
+    elif param_nums_b > 13.33:
         result["gpu_count"] = 8
+    
     return result
 
 

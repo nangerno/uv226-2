@@ -127,37 +127,42 @@ def if_contain_slow_reward_function(dataset_type: dict) -> bool:
 
 
 def get_grpo_config(param_nums: int) -> dict:
-    if param_nums < 1_000_000_000:
-        return GRPO_CONFIG["0_1_b"]
-    elif param_nums < 2_000_000_000:
-        return GRPO_CONFIG["1_2_b"]
-    elif param_nums < 4_000_000_000:
-        return GRPO_CONFIG["2_4_b"]
-    elif param_nums < 5_000_000_000:
-        return GRPO_CONFIG["4_5_b"]
-    elif param_nums < 6_000_000_000:
-        return GRPO_CONFIG["5_6_b"]
-    elif param_nums < 9_000_000_000:
-        return GRPO_CONFIG["6_9_b"]
-    elif param_nums < 12_000_000_000:
-        return GRPO_CONFIG["9_12_b"]
-    elif param_nums < 15_000_000_000:
-        return GRPO_CONFIG["12_15_b"]
-    elif param_nums < 20_000_000_000:
-        return GRPO_CONFIG["15_20_b"]
-    elif param_nums < 40_000_000_000:
-        return GRPO_CONFIG["20_40_b"]
-    elif param_nums < 80_000_000_000:
-        return GRPO_CONFIG["40_80_b"]
-    else:
-        print(f"Model size {param_nums} is not supported")
-        return {
-            "lr": 4e-5,
-            "distributed": "ds",
-            "gpu_count": 8,
-            "batch_size": 6,
-            "use_lora": True,
-        }
+    """
+    Get GRPO configuration based on model parameter count.
+    
+    Uses a sorted list of thresholds for efficient lookup.
+    """
+    # Define size thresholds in ascending order (in billions)
+    size_thresholds = [
+        (1, "0_1_b"),
+        (2, "1_2_b"),
+        (4, "2_4_b"),
+        (5, "4_5_b"),
+        (6, "5_6_b"),
+        (9, "6_9_b"),
+        (12, "9_12_b"),
+        (15, "12_15_b"),
+        (20, "15_20_b"),
+        (40, "20_40_b"),
+        (80, "40_80_b"),
+    ]
+    
+    param_nums_b = param_nums / 1_000_000_000  # Convert to billions
+    
+    # Find appropriate config
+    for threshold_b, config_key in size_thresholds:
+        if param_nums_b < threshold_b:
+            return GRPO_CONFIG[config_key].copy()
+    
+    # Fallback for very large models
+    print(f"Model size {param_nums} ({param_nums_b:.1f}B) is not supported, using default config")
+    return {
+        "lr": 4e-5,
+        "distributed": "ds",
+        "gpu_count": 8,
+        "batch_size": 6,
+        "use_lora": True,
+    }
 
 
 def contain_python_execution(dataset_type: dict) -> bool:

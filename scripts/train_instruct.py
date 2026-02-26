@@ -429,7 +429,7 @@ def main():
             end_time=train_request["end_time"],
             checking_mode=train_request.get("checking_mode", "none")
         ),
-        EarlyStoppingCallback(patience=300, min_delta=0.0001)
+        EarlyStoppingCallback(patience=300, min_delta=0.0001, end_time=train_request.get("end_time", ""), max_steps=max_steps)
     ]
     
     # Add progressive batch size callback if enabled

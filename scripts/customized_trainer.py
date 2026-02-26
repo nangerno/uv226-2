@@ -7,15 +7,49 @@ from transformers import (
     TrainerControl,
 )
 import os
-from typing import Callable, Optional, Dict
+from typing import Callable, Optional, Dict, Any
 import time
 import shutil
 import json
+import stat
 from transformers.trainer_utils import is_main_process
 import wandb
 import torch
 from state_manager import get_state, set_state
+
+# Constants
 MAX_TRIES = 9
+
+# Checkpoint selection thresholds
+LOSS_WORSE_THRESHOLD = 1.15  # 15% worse than best
+LOSS_SIGNIFICANTLY_WORSE = 1.2  # 20% worse - early stop
+OVERFITTING_RATIO_THRESHOLD = 2.0  # Eval loss 2x train loss
+OVERFITTING_PENALTY_FACTOR = 0.3
+SKIP_FULL_EVAL_THRESHOLD = 1.1
+
+# Checkpoint interpolation
+INTERPOLATION_WEIGHT_BEST = 0.6
+INTERPOLATION_WEIGHT_SECOND = 0.4
+INTERPOLATION_SIMILARITY_THRESHOLD = 1.05  # Within 5%
+
+# Time estimation constants
+EVAL_SAVE_TIME_BUFFER_MINUTES = 12
+TIME_VARIANCE_MINUTES = 3
+
+# Evaluation frequency thresholds
+EVAL_FREQUENT_STEPS_TIGHT = 30  # Very frequent in tight time mode
+EVAL_FREQUENT_STEPS_NORMAL = 50  # Frequent near end of training
+EVAL_MODERATE_STEPS = 100  # Moderately frequent
+
+# Progress thresholds for adaptive evaluation
+PROGRESS_THRESHOLD_TIGHT_70 = 0.7  # Last 30% of training
+PROGRESS_THRESHOLD_TIGHT_50 = 0.5  # Last 50% of training
+PROGRESS_THRESHOLD_FREQUENT = 0.8  # Last 20% of training
+PROGRESS_THRESHOLD_MODERATE = 0.6  # Last 40% of training
+
+# Time-aware mode thresholds (minutes)
+TIME_TIGHT_THRESHOLD = 30
+TIME_AMPLE_THRESHOLD = 120
 
 
 MIS_MATCH_VOCAB_SIZE_MODELS = [
@@ -35,7 +69,37 @@ ERROR_GENERATION_CONFIG_MODELS = [
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 
 print(f"LOCAL_RANK: {LOCAL_RANK} in customized_trainer.py", flush=True)
+
+
+def safe_remove_directory(directory: str) -> None:
+    """
+    Safely remove directory with error handling for readonly files.
     
+    Args:
+        directory: Path to directory to remove
+    """
+    if not os.path.exists(directory):
+        return
+    
+    try:
+        # First try: simple removal with ignore_errors
+        shutil.rmtree(directory, ignore_errors=True)
+    except Exception as e:
+        # Second try: handle readonly files by changing permissions
+        print(f"Warning: Error removing directory (ignoring): {e}", flush=True)
+        try:
+            def handle_remove_readonly(func, path, exc):
+                """Handle readonly files by changing permissions before removal."""
+                if os.path.exists(path):
+                    os.chmod(path, stat.S_IWRITE)
+                    func(path)
+            
+            shutil.rmtree(directory, onerror=handle_remove_readonly)
+        except Exception:
+            # If all else fails, just continue - the copytree will handle it
+            pass
+
+
 class CustomEvalSaveCallback(TrainerCallback):
     def __init__(
         self,
@@ -74,9 +138,10 @@ class CustomEvalSaveCallback(TrainerCallback):
         self.eval_loss_trend = []  # Track trend for prediction
         # FRESH: Incremental evaluation - track subset evaluations
         self.subset_eval_results = {}  # step -> subset_eval_loss
-        self.skip_full_eval_threshold = 1.1  # Skip full eval if subset loss > best * this
+        self.skip_full_eval_threshold = SKIP_FULL_EVAL_THRESHOLD
         
-    def compute_loss(self, state: TrainerState, metrics):
+    def compute_loss(self, state: TrainerState, metrics: Dict[str, Any]) -> Optional[float]:
+        """Extract eval_loss from metrics."""
         return metrics.get("eval_loss", None)
 
     def on_step_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
@@ -89,8 +154,13 @@ class CustomEvalSaveCallback(TrainerCallback):
             # print(f"Checking the model at step: {state.global_step}", flush=True)
             # check the time so far to estimate the training time in total 
             my_state = get_state()
+            if "train" not in my_state or "start_time" not in my_state.get("train", {}):
+                print(f"Warning: Missing 'train' or 'start_time' in state, skipping time estimation", flush=True)
+                return control
             start_time_obj = datetime.datetime.strptime(my_state["train"]["start_time"], "%Y-%m-%d %H:%M:%S")
-            start_train_time_obj = datetime.datetime.strptime(my_state["train"]["start_train_time"], "%Y-%m-%d %H:%M:%S")
+            # start_train_time may not exist in all cases, use start_time as fallback
+            start_train_time_str = my_state["train"].get("start_train_time", my_state["train"]["start_time"])
+            start_train_time_obj = datetime.datetime.strptime(start_train_time_str, "%Y-%m-%d %H:%M:%S")
             
             log_content = f"Checking the model at step: {state.global_step}"
             now = datetime.datetime.now()
@@ -100,21 +170,60 @@ class CustomEvalSaveCallback(TrainerCallback):
             log_content += f"\nTime so far: {time_so_far}"
             time_for_one_step = (now - start_train_time_obj).total_seconds() / self.checking_step
             log_content += f"\nTime for one step: {time_for_one_step}"
+            
+            # Improved time estimation: account for potential slowdown as training progresses
+            # Early steps are often faster (warmup, cache effects), so we apply a slowdown factor
+            # This is a conservative estimate to avoid over-committing
+            progress_ratio = state.global_step / max(self.total_steps_all_epochs, 1)
+            # Apply 1.1x slowdown factor for remaining steps (10% slower on average)
+            # This accounts for: longer sequences, more complex gradients, memory fragmentation
+            slowdown_factor = 1.1 if progress_ratio > 0.1 else 1.0  # Only apply after 10% progress
+            
             # Now estimate the total training time for this training
             log_content += f"\nTotal steps all epochs: {self.total_steps_all_epochs}"
-            total_remaining_training_time = time_for_one_step * (self.total_steps_all_epochs - state.global_step)
+            remaining_steps = self.total_steps_all_epochs - state.global_step
+            total_remaining_training_time = time_for_one_step * remaining_steps * slowdown_factor
+            if slowdown_factor > 1.0:
+                log_content += f"\nApplied slowdown factor: {slowdown_factor:.2f}x (conservative estimate)"
             log_content += f"\nTotal remaining training time: {total_remaining_training_time}"
             # n * time_so_far + total_remaining_training_time = total_remaining_time
             end_time_obj = datetime.datetime.strptime(self.end_time, "%Y-%m-%d %H:%M:%S")
             total_remaining_time = (end_time_obj - now).total_seconds()
             log_content += f"\nTotal remaining time: {total_remaining_time}"
             
-            # n * time_so_far + (time_so_far + total_remaining_training_time) = total_remaining_time
-            # time_so_far + total_remaining_training_time is the time it takes to finish the training (need to estimate the eval time and save time, assuming this is 15 minutes)
-            # assuming time_so_far is + 5 minutes, just in case the checking step takes more time than expected
-            max_var_time_sofar = 3 * 60
-            n = (total_remaining_time - (time_so_far + total_remaining_training_time + 12 * 60)) / (time_so_far + max_var_time_sofar) # 300 = 5 minutes, assume that it extra time would be more or less 5 minutes
+            # Improved time estimation accounting for evaluation overhead
+            # Each run requires: training time + evaluation time + checkpoint saving time
+            # Estimate evaluation time: typically 2-5 minutes per evaluation
+            # With adaptive evaluation frequency, estimate ~10-20 evaluations per run
+            # Store for use in evaluation skipping logic
+            self.avg_eval_time_minutes = 3  # Conservative estimate
+            evaluations_per_run = 15  # Estimate based on adaptive frequency
+            eval_overhead_per_run = self.avg_eval_time_minutes * evaluations_per_run * 60  # in seconds
+            
+            # Estimate checkpoint saving time (including potential interpolation)
+            checkpoint_save_time = 5 * 60  # 5 minutes base, could be more with interpolation
+            
+            # Total overhead per run: eval + save + variance
+            max_var_time_sofar = TIME_VARIANCE_MINUTES * 60
+            overhead_per_run = eval_overhead_per_run + checkpoint_save_time + max_var_time_sofar
+            
+            # Calculate how many additional runs we can fit
+            # Formula: n * (time_per_run + overhead) + current_run_remaining_time <= total_remaining_time
+            time_per_run = time_so_far + max_var_time_sofar
+            total_time_per_run = time_per_run + overhead_per_run
+            
+            # Reserve time for final checkpoint saving and evaluation
+            final_save_buffer = max(EVAL_SAVE_TIME_BUFFER_MINUTES * 60, checkpoint_save_time * 2)  # At least 2x for safety
+            
+            available_time = total_remaining_time - total_remaining_training_time - final_save_buffer
+            n = available_time / total_time_per_run if total_time_per_run > 0 else 0
             n = int(n)
+            
+            log_content += f"\nTime estimation details:"
+            log_content += f"\n  Evaluation overhead per run: {eval_overhead_per_run/60:.1f} min ({evaluations_per_run} evals × {self.avg_eval_time_minutes} min)"
+            log_content += f"\n  Checkpoint save time: {checkpoint_save_time/60:.1f} min"
+            log_content += f"\n  Total overhead per run: {overhead_per_run/60:.1f} min"
+            log_content += f"\n  Final save buffer: {final_save_buffer/60:.1f} min"
             my_state["check_details"] = {
                 "now": str(now.strftime("%Y-%m-%d %H:%M:%S")),
                 "start_time": str(start_time_obj.strftime("%Y-%m-%d %H:%M:%S")),
@@ -155,6 +264,8 @@ class CustomEvalSaveCallback(TrainerCallback):
         elif state.global_step == self.checking_step and self.checking_mode == "second_time": # at second time, we don't estimate the training time again, just save the current_loss
             log_content = f"Checking the model at step: {state.global_step} where check_mode=second_time"            
             my_state = get_state()
+            if "train" not in my_state:
+                my_state["train"] = {}
             current_loss = state.log_history[-1]["loss"]
             my_state["train"]["current_loss"] = current_loss
             
@@ -171,6 +282,17 @@ class CustomEvalSaveCallback(TrainerCallback):
             # We'll decide in on_evaluate whether to continue or stop based on eval_loss
             control.should_training_stop = True
             
+            # OPTIMIZATION: If this is clearly the best run so far and we have limited time,
+            # consider committing early to save time for final training
+            if "runs" in my_state and len(my_state["runs"]) > 0:
+                # Check if current run is significantly better than previous runs
+                previous_best_loss = min([run.get("current_eval_loss", run["current_loss"]) for run in my_state["runs"]])
+                # If current loss is >10% better, this is a strong signal
+                if current_loss < previous_best_loss * 0.9:
+                    remaining_runs = my_state.get("next_runs", 1) - len(my_state["runs"]) - 1
+                    if remaining_runs > 2:  # If we have many runs left
+                        print(f"OPTIMIZATION: Current run loss {current_loss:.6f} is >10% better than best {previous_best_loss:.6f}. Consider early commitment after eval.", flush=True)
+            
             if is_main_process(LOCAL_RANK):
                 set_state(my_state)
                 print(log_content, flush=True)
@@ -183,11 +305,26 @@ class CustomEvalSaveCallback(TrainerCallback):
             if state.global_step in self.checkpoint_predictions:
                 predicted_loss = self.checkpoint_predictions[state.global_step]
                 best_loss = self.best_checkpoint_info["loss"] if self.best_checkpoint_info else float('inf')
-                if predicted_loss > best_loss * 1.15:  # 15% worse than best
-                    print(f"FRESH: Skipping evaluation at step {state.global_step} - predicted loss {predicted_loss:.6f} is poor (best: {best_loss:.6f})", flush=True)
+                if predicted_loss > best_loss * LOSS_WORSE_THRESHOLD:
+                    avg_eval_time = getattr(self, 'avg_eval_time_minutes', 3)
+                    print(f"FRESH: Skipping evaluation at step {state.global_step} - predicted loss {predicted_loss:.6f} is poor (best: {best_loss:.6f}), saving ~{avg_eval_time} min", flush=True)
                     control.should_evaluate = False
                     control.should_save = False  # Don't save poor checkpoints
                     return control
+            
+            # OPTIMIZATION: Skip evaluation if loss trend is clearly improving
+            # If we've seen consistent improvement, we can skip some evaluations
+            if len(self.eval_loss_trend) >= 3:
+                recent_trends = self.eval_loss_trend[-3:]
+                if all(t < 0 for t in recent_trends):  # All recent trends are negative (improving)
+                    avg_improvement = sum(recent_trends) / len(recent_trends)
+                    # If improving at >0.5% per evaluation, skip this one (will catch up later)
+                    if abs(avg_improvement) > self.last_eval_loss * 0.005 if self.last_eval_loss else False:
+                        # Only skip if we're not near the end (don't risk missing best checkpoint)
+                        if self.max_steps == -1 or state.global_step < self.max_steps * 0.9:
+                            print(f"OPTIMIZATION: Skipping evaluation at step {state.global_step} - loss improving consistently ({avg_improvement:.6f}/eval), will evaluate next time", flush=True)
+                            control.should_evaluate = False
+                            return control
             
             # do not allow the pod to be stopped by any reason 
                 # first check if there is at least one checkpoint or not 
@@ -201,6 +338,393 @@ class CustomEvalSaveCallback(TrainerCallback):
                     self.save_only = True
         return control
 
+    def _handle_subset_evaluation(self, state: TrainerState, eval_loss: float, control: TrainerControl) -> Optional[TrainerControl]:
+        """
+        Handle subset evaluation - skip full evaluation if subset loss is poor.
+        
+        Returns:
+            TrainerControl if should skip full evaluation, None otherwise
+        """
+        best_loss = self.best_checkpoint_info["loss"] if self.best_checkpoint_info else float('inf')
+        if eval_loss > best_loss * self.skip_full_eval_threshold:
+            print(f"FRESH: Skipping full evaluation - subset loss {eval_loss:.6f} > best {best_loss:.6f} * {self.skip_full_eval_threshold}", flush=True)
+            return control
+        else:
+            print(f"FRESH: Subset loss {eval_loss:.6f} is promising, proceeding with full evaluation", flush=True)
+            return None
+
+    def _track_and_predict_loss_trend(self, eval_loss: float, state: TrainerState) -> None:
+        """
+        Track eval loss trend and predict next checkpoint quality.
+        
+        Args:
+            eval_loss: Current evaluation loss
+            state: Trainer state
+        """
+        if self.last_eval_loss is not None:
+            trend = eval_loss - self.last_eval_loss
+            self.eval_loss_trend.append(trend)
+            # Keep only last 5 trends
+            if len(self.eval_loss_trend) > 5:
+                self.eval_loss_trend = self.eval_loss_trend[-5:]
+            
+            # Predict next checkpoint quality based on trend
+            if len(self.eval_loss_trend) >= 2:
+                avg_trend = sum(self.eval_loss_trend[-3:]) / min(3, len(self.eval_loss_trend))
+                predicted_next_loss = eval_loss + avg_trend
+                self.checkpoint_predictions[state.global_step + 100] = predicted_next_loss
+                
+                # If predicted loss is very poor, suggest early stopping
+                best_loss = self.best_checkpoint_info["loss"] if self.best_checkpoint_info else eval_loss
+                if predicted_next_loss > best_loss * LOSS_WORSE_THRESHOLD:
+                    print(f"FRESH: Predicted next checkpoint will be poor (predicted={predicted_next_loss:.6f} vs best={best_loss:.6f}), consider early stopping", flush=True)
+        
+        self.last_eval_loss = eval_loss
+
+    def _handle_checking_step_evaluation(self, state: TrainerState, eval_loss: float, control: TrainerControl) -> TrainerControl:
+        """
+        Handle evaluation at checking_step for multi-run selection.
+        
+        Args:
+            state: Trainer state
+            eval_loss: Current evaluation loss
+            control: Trainer control
+            
+        Returns:
+            Modified TrainerControl
+        """
+        my_state = get_state()
+        if "train" not in my_state:
+            my_state["train"] = {}
+        my_state["train"]["current_eval_loss"] = eval_loss
+        print(f"CRITICAL: Stored eval_loss {eval_loss:.6f} at checking_step {state.global_step} for multi-run selection", flush=True)
+        
+        # Now make decision based on eval_loss instead of train_loss
+        current_is_the_best = False
+        control.should_training_stop = True
+        
+        if "runs" in my_state and len(my_state["runs"]) > 0:
+            # Use eval_loss for comparison (CRITICAL IMPROVEMENT)
+            if all("current_eval_loss" in run for run in my_state["runs"]):
+                current_min_eval_loss = min([run.get("current_eval_loss", run["current_loss"]) for run in my_state["runs"]])
+                comparison_loss = eval_loss
+                print(f"Comparing eval_loss: {eval_loss:.6f} vs best eval_loss: {current_min_eval_loss:.6f}", flush=True)
+            else:
+                # Fallback: compare with train_loss if eval_loss not available in previous runs
+                current_min_loss = min([run["current_loss"] for run in my_state["runs"]])
+                comparison_loss = eval_loss  # Still use eval_loss for this run
+                current_min_eval_loss = current_min_loss
+                print(f"Comparing eval_loss: {eval_loss:.6f} vs best train_loss: {current_min_eval_loss:.6f} (fallback)", flush=True)
+            
+            # Improved comparison: use small epsilon for floating point comparison
+            # and consider it "equal" if within 0.1% (accounts for numerical precision)
+            epsilon = current_min_eval_loss * 0.001
+            if eval_loss <= current_min_eval_loss + epsilon:
+                # If this is the last run and loss is best/equal, continue to completion
+                if len(my_state["runs"]) + 1 == my_state["next_runs"]:
+                    if eval_loss < current_min_eval_loss - epsilon:
+                        print(f"CRITICAL: Eval loss {eval_loss:.6f} is better than best {current_min_eval_loss:.6f}, continuing training", flush=True)
+                    else:
+                        print(f"CRITICAL: Eval loss {eval_loss:.6f} is equal to best {current_min_eval_loss:.6f} (within 0.1%), continuing training", flush=True)
+                    current_is_the_best = True
+                else:
+                    # OPTIMIZATION: Early commitment strategy
+                    # If this run is significantly better (>5%) and we have many runs left,
+                    # consider committing early to save time for final training
+                    relative_improvement = (current_min_eval_loss - eval_loss) / current_min_eval_loss if current_min_eval_loss > 0 else 0
+                    remaining_runs = my_state.get("next_runs", 1) - len(my_state["runs"]) - 1
+                    
+                    if relative_improvement > 0.05 and remaining_runs > 2:
+                        print(f"OPTIMIZATION: Eval loss {eval_loss:.6f} is {relative_improvement*100:.1f}% better than best {current_min_eval_loss:.6f}", flush=True)
+                        print(f"  Consider early commitment: {remaining_runs} runs remaining. Current strategy: continue exploration.", flush=True)
+                    
+                    print(f"Eval loss {eval_loss:.6f} is best/equal, but not last run. Will continue with next LR.", flush=True)
+            else:
+                # Adaptive early termination with improved logic
+                # Calculate relative difference
+                relative_diff = (eval_loss - current_min_eval_loss) / current_min_eval_loss if current_min_eval_loss > 0 else float('inf')
+                
+                if relative_diff > (LOSS_SIGNIFICANTLY_WORSE - 1.0):
+                    # Significantly worse: stop immediately
+                    print(f"ADAPTIVE TERMINATION: Eval loss {eval_loss:.6f} is {relative_diff*100:.1f}% worse than best {current_min_eval_loss:.6f}, stopping early", flush=True)
+                    control.should_training_stop = True
+                elif relative_diff > (LOSS_WORSE_THRESHOLD - 1.0):
+                    # Moderately worse: still stop but log the difference
+                    print(f"Eval loss {eval_loss:.6f} is {relative_diff*100:.1f}% worse than best {current_min_eval_loss:.6f}, stopping this run", flush=True)
+                    control.should_training_stop = True
+                else:
+                    # Slightly worse: still stop but note it's close
+                    print(f"Eval loss {eval_loss:.6f} is {relative_diff*100:.1f}% worse than best {current_min_eval_loss:.6f}, stopping this run (close but not best)", flush=True)
+                    control.should_training_stop = True
+        else:
+            # First run in the series
+            if my_state.get("next_runs", 1) == 1:
+                current_is_the_best = True
+                print(f"Only one run, continuing training", flush=True)
+        
+        if current_is_the_best:
+            control.should_training_stop = False
+            my_state["mode"] = "finish"
+        else:
+            # Don't save if not best to save time and space
+            control.should_save = False
+        
+        if is_main_process(LOCAL_RANK):
+            set_state(my_state)
+        self._capture_eval_loss_at_checking = False
+        self._checking_step_eval_loss = eval_loss
+        
+        return control
+
+    def _compute_generalization_score(self, eval_loss: float, train_loss: Optional[float]) -> tuple[float, float]:
+        """
+        Compute generalization score with overfitting penalty.
+        
+        Args:
+            eval_loss: Evaluation loss
+            train_loss: Training loss (optional)
+            
+        Returns:
+            Tuple of (generalization_score, overfitting_penalty)
+        """
+        generalization_score = eval_loss
+        overfitting_penalty = 0.0
+        
+        if train_loss is not None and train_loss > 0:
+            overfitting_gap = max(0, eval_loss - train_loss)
+            overfitting_penalty = OVERFITTING_PENALTY_FACTOR * overfitting_gap
+            generalization_score = eval_loss - overfitting_penalty
+            print(f"Step {self.best_checkpoint_info['step'] if self.best_checkpoint_info else 'unknown'}: eval_loss={eval_loss:.6f}, train_loss={train_loss:.6f}, overfitting_gap={overfitting_gap:.6f}, generalization_score={generalization_score:.6f}", flush=True)
+        else:
+            print(f"Step {self.best_checkpoint_info['step'] if self.best_checkpoint_info else 'unknown'}: eval_loss={eval_loss:.6f}, train_loss=None, generalization_score={generalization_score:.6f}", flush=True)
+        
+        return generalization_score, overfitting_penalty
+
+    def _should_update_best_checkpoint(self, generalization_score: float, eval_loss: float, state: TrainerState) -> bool:
+        """
+        Determine if best checkpoint should be updated.
+        Uses generalization_score as primary metric, with tie-breaking logic.
+        
+        Args:
+            generalization_score: Computed generalization score
+            eval_loss: Evaluation loss
+            state: Trainer state for additional context
+            
+        Returns:
+            True if should update, False otherwise
+        """
+        if self.best_checkpoint_info is None:
+            return True
+        
+        current_best_score = self.best_checkpoint_info.get("generalization_score", self.best_checkpoint_info["loss"])
+        current_best_eval_loss = self.best_checkpoint_info["loss"]
+        
+        # Primary comparison: generalization_score
+        if generalization_score < current_best_score:
+            return True
+        elif generalization_score > current_best_score:
+            return False
+        else:
+            # Tie-breaking: if generalization scores are equal, prefer:
+            # 1. Lower eval_loss (better raw performance)
+            # 2. Earlier step (less risk of overfitting, more training time remaining)
+            if eval_loss < current_best_eval_loss:
+                return True
+            elif eval_loss > current_best_eval_loss:
+                return False
+            else:
+                # If both scores and losses are equal, prefer earlier checkpoint
+                # (gives more time for further training)
+                return state.global_step < self.best_checkpoint_info["step"]
+
+    def _should_use_interpolation(self) -> bool:
+        """
+        Determine if checkpoint interpolation should be used.
+        Only interpolate if checkpoints are similar in quality (within threshold).
+        
+        Returns:
+            True if should interpolate, False otherwise
+        """
+        if len(self.top_checkpoints) < 2:
+            return False
+        
+        best_score = self.top_checkpoints[0]["generalization_score"]
+        second_score = self.top_checkpoints[1]["generalization_score"]
+        
+        # Only interpolate if second best is within threshold of best
+        # This ensures we're not mixing good and bad checkpoints
+        return second_score < best_score * INTERPOLATION_SIMILARITY_THRESHOLD
+    
+    def _compute_adaptive_interpolation_weights(self, ckpt1: dict, ckpt2: dict) -> tuple[float, float]:
+        """
+        Compute adaptive interpolation weights based on performance gap.
+        If checkpoints are very similar, use more balanced weights.
+        If one is clearly better, give it more weight.
+        
+        Args:
+            ckpt1: First checkpoint info (best)
+            ckpt2: Second checkpoint info (second best)
+            
+        Returns:
+            Tuple of (weight1, weight2) for interpolation
+        """
+        score1 = ckpt1["generalization_score"]
+        score2 = ckpt2["generalization_score"]
+        
+        # Calculate performance gap ratio
+        gap_ratio = score2 / score1 if score1 > 0 else 1.0
+        
+        # If scores are very similar (gap < 2%), use balanced weights (0.55, 0.45)
+        # If gap is larger, use more weight on best checkpoint
+        if gap_ratio < 1.02:  # Within 2%
+            weight1, weight2 = 0.55, 0.45
+        elif gap_ratio < 1.05:  # Within 5% (similarity threshold)
+            # Linear interpolation between balanced and default weights
+            # Closer scores -> more balanced, further scores -> more weight on best
+            balance_factor = (1.05 - gap_ratio) / 0.03  # 0 to 1 as gap goes from 5% to 2%
+            weight1 = 0.55 + balance_factor * 0.05  # 0.55 to 0.6
+            weight2 = 1.0 - weight1
+        else:
+            # Use default weights for larger gaps
+            weight1, weight2 = INTERPOLATION_WEIGHT_BEST, INTERPOLATION_WEIGHT_SECOND
+        
+        return weight1, weight2
+
+    def _load_checkpoint_state_dicts(self, ckpt1_path: str, ckpt2_path: str, filename: str) -> Optional[tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], bool]]:
+        """
+        Load state dicts from two checkpoints.
+        
+        Args:
+            ckpt1_path: Path to first checkpoint directory
+            ckpt2_path: Path to second checkpoint directory
+            filename: Name of the model file to load
+            
+        Returns:
+            Tuple of (state1, state2, has_safetensors) or None if loading fails
+        """
+        file1_path = os.path.join(ckpt1_path, filename)
+        file2_path = os.path.join(ckpt2_path, filename)
+        
+        if not os.path.exists(file2_path):
+            return None
+        
+        try:
+            from safetensors.torch import load_file
+            has_safetensors = True
+        except ImportError:
+            has_safetensors = False
+        
+        try:
+            if filename.endswith(".safetensors") and has_safetensors:
+                state1 = load_file(file1_path)
+                state2 = load_file(file2_path)
+            else:
+                state1 = torch.load(file1_path, map_location="cpu")
+                state2 = torch.load(file2_path, map_location="cpu")
+            
+            return state1, state2, has_safetensors
+        except Exception as e:
+            print(f"  Warning: Failed to load state dicts from {filename}: {e}", flush=True)
+            return None
+
+    def _interpolate_state_dicts(self, state1: Dict[str, torch.Tensor], state2: Dict[str, torch.Tensor], weight1: float, weight2: float) -> Dict[str, torch.Tensor]:
+        """
+        Interpolate two state dicts with given weights.
+        
+        Args:
+            state1: First state dict
+            state2: Second state dict
+            weight1: Weight for first state dict
+            weight2: Weight for second state dict
+            
+        Returns:
+            Interpolated state dict
+        """
+        interpolated = {}
+        for key in state1.keys():
+            if key in state2 and state1[key].shape == state2[key].shape:
+                interpolated[key] = weight1 * state1[key] + weight2 * state2[key]
+            else:
+                interpolated[key] = state1[key]  # Use ckpt1 if key missing in ckpt2
+        return interpolated
+
+    def _interpolate_checkpoints(self, ckpt1: dict, ckpt2: dict) -> str:
+        """
+        Interpolate two checkpoints and save to submission directory.
+        Uses adaptive weights based on performance gap.
+        
+        Args:
+            ckpt1: First checkpoint info dict (best)
+            ckpt2: Second checkpoint info dict (second best)
+            
+        Returns:
+            Interpolation info string
+        """
+        print(f"DECISIVE: Interpolating top 2 checkpoints for better generalization", flush=True)
+        print(f"  Checkpoint 1: step={ckpt1['step']}, gen_score={ckpt1['generalization_score']:.6f}, eval_loss={ckpt1['eval_loss']:.6f}", flush=True)
+        print(f"  Checkpoint 2: step={ckpt2['step']}, gen_score={ckpt2['generalization_score']:.6f}, eval_loss={ckpt2['eval_loss']:.6f}", flush=True)
+        
+        # Use adaptive weights based on performance gap
+        weight1, weight2 = self._compute_adaptive_interpolation_weights(ckpt1, ckpt2)
+        print(f"  Using adaptive weights: {weight1:.3f} * ckpt1 + {weight2:.3f} * ckpt2 (based on performance gap)", flush=True)
+        ckpt1_path = os.path.join(self.output_dir, f"checkpoint-{ckpt1['step']}")
+        ckpt2_path = os.path.join(self.output_dir, f"checkpoint-{ckpt2['step']}")
+        
+        # Check if both checkpoints exist
+        if not (os.path.exists(ckpt1_path) and os.path.exists(ckpt2_path)):
+            print(f"  Warning: Checkpoints not found, using best checkpoint only", flush=True)
+            self._copy_best_checkpoint()
+            return "single_best"
+        
+        # Find model files (could be .bin or .safetensors)
+        import glob
+        ckpt1_files = glob.glob(os.path.join(ckpt1_path, "*.safetensors"))
+        if not ckpt1_files:
+            ckpt1_files = glob.glob(os.path.join(ckpt1_path, "*.bin"))
+        
+        if not ckpt1_files:
+            print(f"  Warning: Could not find model files, using best checkpoint only", flush=True)
+            self._copy_best_checkpoint()
+            return "single_best"
+        
+        # Copy first checkpoint as base
+        shutil.copytree(ckpt1_path, self.submission_dir)
+        
+        # Interpolate weights (already computed adaptively above)
+        
+        try:
+            from safetensors.torch import save_file
+            has_safetensors_save = True
+        except ImportError:
+            has_safetensors_save = False
+        
+        for file_path in ckpt1_files:
+            filename = os.path.basename(file_path)
+            output_path = os.path.join(self.submission_dir, filename)
+            
+            result = self._load_checkpoint_state_dicts(ckpt1_path, ckpt2_path, filename)
+            if result is None:
+                continue
+            
+            state1, state2, has_safetensors = result
+            interpolated = self._interpolate_state_dicts(state1, state2, weight1, weight2)
+            
+            # Save interpolated weights
+            try:
+                if filename.endswith(".safetensors") and has_safetensors_save:
+                    save_file(interpolated, output_path)
+                else:
+                    torch.save(interpolated, output_path)
+            except Exception as e:
+                print(f"  Warning: Failed to save interpolated weights for {filename}: {e}", flush=True)
+        
+        print(f"  Successfully interpolated checkpoints", flush=True)
+        return f"interpolated:step1={ckpt1['step']},step2={ckpt2['step']},w1={weight1},w2={weight2}"
+
+    def _copy_best_checkpoint(self) -> None:
+        """Copy the best checkpoint to submission directory."""
+        best_checkpoint_path = os.path.join(self.output_dir, f"checkpoint-{self.best_checkpoint_info['step']}")
+        shutil.copytree(best_checkpoint_path, self.submission_dir)
 
     def on_evaluate(
         self, args, state: TrainerState, control: TrainerControl, metrics, **kwargs
@@ -213,111 +737,35 @@ class CustomEvalSaveCallback(TrainerCallback):
             return control 
         
         # FRESH: Incremental evaluation - check if this is a subset evaluation
-        # If subset loss is poor, skip full evaluation to save time
         is_subset_eval = metrics.get("_is_subset_eval", False)
         if is_subset_eval:
             subset_loss = eval_loss
             self.subset_eval_results[state.global_step] = subset_loss
             print(f"FRESH: Subset evaluation at step {state.global_step}: loss={subset_loss:.6f}", flush=True)
             
-            # Predict if full evaluation is worth it
-            best_loss = self.best_checkpoint_info["loss"] if self.best_checkpoint_info else float('inf')
-            if subset_loss > best_loss * self.skip_full_eval_threshold:
-                print(f"FRESH: Skipping full evaluation - subset loss {subset_loss:.6f} > best {best_loss:.6f} * {self.skip_full_eval_threshold}", flush=True)
-                # Don't do full evaluation, just return
-                return control
-            else:
-                print(f"FRESH: Subset loss {subset_loss:.6f} is promising, proceeding with full evaluation", flush=True)
+            # Skip full evaluation if subset loss is poor
+            skip_result = self._handle_subset_evaluation(state, subset_loss, control)
+            if skip_result is not None:
+                return skip_result
         
         print(f"GO INTO CUSTOMIZED EVALUATE AT STEP: {state.global_step}", flush=True)
         
         # FRESH: Smart checkpoint pruning - predict quality early
         if eval_loss is not None:
-            # Track eval loss trend for prediction
-            if self.last_eval_loss is not None:
-                trend = eval_loss - self.last_eval_loss
-                self.eval_loss_trend.append(trend)
-                # Keep only last 5 trends
-                if len(self.eval_loss_trend) > 5:
-                    self.eval_loss_trend = self.eval_loss_trend[-5:]
-                
-                # Predict next checkpoint quality based on trend
-                if len(self.eval_loss_trend) >= 2:
-                    avg_trend = sum(self.eval_loss_trend[-3:]) / min(3, len(self.eval_loss_trend))
-                    predicted_next_loss = eval_loss + avg_trend
-                    self.checkpoint_predictions[state.global_step + 100] = predicted_next_loss
-                    
-                    # If predicted loss is very poor, suggest early stopping
-                    best_loss = self.best_checkpoint_info["loss"] if self.best_checkpoint_info else eval_loss
-                    if predicted_next_loss > best_loss * 1.15:  # 15% worse
-                        print(f"FRESH: Predicted next checkpoint will be poor (predicted={predicted_next_loss:.6f} vs best={best_loss:.6f}), consider early stopping", flush=True)
-            
-            self.last_eval_loss = eval_loss
+            self._track_and_predict_loss_trend(eval_loss, state)
         
         # CRITICAL: Store eval_loss at checking_step for multi-run selection
         if hasattr(self, '_capture_eval_loss_at_checking') and self._capture_eval_loss_at_checking:
             if state.global_step == self.checking_step and self.checking_mode == "second_time":
                 if eval_loss is not None:
-                    my_state = get_state()
-                    my_state["train"]["current_eval_loss"] = eval_loss
-                    print(f"CRITICAL: Stored eval_loss {eval_loss:.6f} at checking_step {state.global_step} for multi-run selection", flush=True)
-                    
-                    # Now make decision based on eval_loss instead of train_loss
-                    current_is_the_best = False
-                    control.should_training_stop = True
-                    
-                    if "runs" in my_state and len(my_state["runs"]) > 0:
-                        # Use eval_loss for comparison (CRITICAL IMPROVEMENT)
-                        if all("current_eval_loss" in run for run in my_state["runs"]):
-                            current_min_eval_loss = min([run.get("current_eval_loss", run["current_loss"]) for run in my_state["runs"]])
-                            comparison_loss = eval_loss
-                            print(f"Comparing eval_loss: {eval_loss:.6f} vs best eval_loss: {current_min_eval_loss:.6f}", flush=True)
-                        else:
-                            # Fallback: compare with train_loss if eval_loss not available in previous runs
-                            current_min_loss = min([run["current_loss"] for run in my_state["runs"]])
-                            comparison_loss = eval_loss  # Still use eval_loss for this run
-                            current_min_eval_loss = current_min_loss
-                            print(f"Comparing eval_loss: {eval_loss:.6f} vs best train_loss: {current_min_eval_loss:.6f} (fallback)", flush=True)
-                        
-                        if eval_loss <= current_min_eval_loss:
-                            if len(my_state["runs"]) + 1 == my_state["next_runs"]:
-                                print(f"CRITICAL: Eval loss {eval_loss:.6f} is best or equal to best {current_min_eval_loss:.6f}, continuing training", flush=True)
-                                current_is_the_best = True
-                            else:
-                                print(f"Eval loss {eval_loss:.6f} is best, but not last run. Will continue with next LR.", flush=True)
-                        else:
-                            # Adaptive early termination: if eval_loss is significantly worse, stop early
-                            if eval_loss > current_min_eval_loss * 1.2:  # 20% worse
-                                print(f"ADAPTIVE TERMINATION: Eval loss {eval_loss:.6f} is >20% worse than best {current_min_eval_loss:.6f}, stopping early", flush=True)
-                                control.should_training_stop = True
-                            else:
-                                print(f"Eval loss {eval_loss:.6f} is worse than best {current_min_eval_loss:.6f}, stopping this run", flush=True)
-                    else:
-                        # First run in the series
-                        if my_state.get("next_runs", 1) == 1:
-                            current_is_the_best = True
-                            print(f"Only one run, continuing training", flush=True)
-                    
-                    if current_is_the_best:
-                        control.should_training_stop = False
-                        my_state["mode"] = "finish"
-                    else:
-                        # Don't save if not best to save time and space
-                        control.should_save = False
-                    
-                    if is_main_process(LOCAL_RANK):
-                        set_state(my_state)
-                    self._capture_eval_loss_at_checking = False
-                    self._checking_step_eval_loss = eval_loss
-                    
-                    return control
+                    return self._handle_checking_step_evaluation(state, eval_loss, control)
         
         # Monitor train/eval gap for overfitting detection
         if state.log_history:
             last_train_loss = state.log_history[-1].get("loss", None)
             if last_train_loss and eval_loss:
                 gap_ratio = eval_loss / last_train_loss if last_train_loss > 0 else float('inf')
-                if gap_ratio > 2.0:  # Eval loss is 2x train loss = overfitting
+                if gap_ratio > OVERFITTING_RATIO_THRESHOLD:
                     print(f"WARNING: Overfitting detected! Train loss: {last_train_loss:.6f}, Eval loss: {eval_loss:.6f}, Ratio: {gap_ratio:.2f}", flush=True)
         
         # DECISIVE: Overfitting-aware checkpoint selection
@@ -331,29 +779,10 @@ class CustomEvalSaveCallback(TrainerCallback):
         # eval_loss is already cross-entropy, so we use it directly
         if eval_loss is not None:
             # DECISIVE: Compute generalization_score to penalize overfitting
-            # generalization_score = eval_loss - penalty * overfitting_gap
-            # Lower score is better (we want low eval_loss and low overfitting)
-            generalization_score = eval_loss
-            overfitting_penalty = 0.0
-            if train_loss is not None and train_loss > 0:
-                overfitting_gap = max(0, eval_loss - train_loss)
-                # Penalize overfitting: if eval_loss is much higher than train_loss, penalize it
-                # Use 0.3 as penalty factor (tuned for tournament)
-                overfitting_penalty = 0.3 * overfitting_gap
-                generalization_score = eval_loss - overfitting_penalty
-                print(f"Step {state.global_step}: eval_loss={eval_loss:.6f}, train_loss={train_loss:.6f}, overfitting_gap={overfitting_gap:.6f}, generalization_score={generalization_score:.6f}", flush=True)
-            else:
-                print(f"Step {state.global_step}: eval_loss={eval_loss:.6f}, train_loss=None, generalization_score={generalization_score:.6f}", flush=True)
+            generalization_score, overfitting_penalty = self._compute_generalization_score(eval_loss, train_loss)
             
             # Update best checkpoint using generalization_score (not just eval_loss)
-            should_update = False
-            if self.best_checkpoint_info is None:
-                should_update = True
-            else:
-                # Compare using generalization_score for better generalization
-                current_best_score = self.best_checkpoint_info.get("generalization_score", self.best_checkpoint_info["loss"])
-                if generalization_score < current_best_score:
-                    should_update = True
+            should_update = self._should_update_best_checkpoint(generalization_score)
             
             if should_update:
                 print(f"DECISIVE: Updating best checkpoint at step {state.global_step} with generalization_score: {generalization_score:.6f} (eval_loss: {eval_loss:.6f})", flush=True)
@@ -405,26 +834,7 @@ class CustomEvalSaveCallback(TrainerCallback):
             print(f"Only save the model at step: {state.global_step}, no evaluation", flush=True)
             current_step = state.global_step
             # Remove existing directory if it exists
-            if os.path.exists(self.submission_dir):
-                try:
-                    # Use ignore_errors=True to handle FileNotFoundError and other errors gracefully
-                    shutil.rmtree(self.submission_dir, ignore_errors=True)
-                except Exception as e:
-                    # Catch all exceptions to prevent crashes from file system issues
-                    # This handles FileNotFoundError, PermissionError, and other filesystem errors
-                    print(f"Warning: Error removing submission directory (ignoring): {e}", flush=True)
-                    # Try to continue even if removal failed
-                    try:
-                        # If rmtree failed, try to remove individual files that might be causing issues
-                        import stat
-                        def handle_remove_readonly(func, path, exc):
-                            if os.path.exists(path):
-                                os.chmod(path, stat.S_IWRITE)
-                                func(path)
-                        shutil.rmtree(self.submission_dir, onerror=handle_remove_readonly)
-                    except Exception:
-                        # If all else fails, just continue - the copytree will handle it
-                        pass
+            safe_remove_directory(self.submission_dir)
                 
             shutil.copytree(
                 os.path.join(self.output_dir, f"checkpoint-{current_step}"),
@@ -447,155 +857,49 @@ class CustomEvalSaveCallback(TrainerCallback):
         ):
             print(f"Copy the best checkpoint to the submission directory at step: {state.global_step}", flush=True)
             # Remove existing directory if it exists
-            if os.path.exists(self.submission_dir):
-                try:
-                    # Use ignore_errors=True to handle FileNotFoundError and other errors gracefully
-                    shutil.rmtree(self.submission_dir, ignore_errors=True)
-                except Exception as e:
-                    # Catch all exceptions to prevent crashes from file system issues
-                    # This handles FileNotFoundError, PermissionError, and other filesystem errors
-                    print(f"Warning: Error removing submission directory (ignoring): {e}", flush=True)
-                    # Try to continue even if removal failed
-                    try:
-                        # If rmtree failed, try to remove individual files that might be causing issues
-                        import stat
-                        def handle_remove_readonly(func, path, exc):
-                            if os.path.exists(path):
-                                os.chmod(path, stat.S_IWRITE)
-                                func(path)
-                        shutil.rmtree(self.submission_dir, onerror=handle_remove_readonly)
-                    except Exception:
-                        # If all else fails, just continue - the copytree will handle it
-                        pass
+            safe_remove_directory(self.submission_dir)
             
             best_eval_loss = self.best_checkpoint_info["loss"]
             best_gen_score = self.best_checkpoint_info.get("generalization_score", best_eval_loss)
             
-            # DECISIVE: Checkpoint interpolation - use top 2 checkpoints if available
-            # Only interpolate if we have 2 good checkpoints and time permits
-            use_interpolation = (
-                len(self.top_checkpoints) >= 2 
-                and self.top_checkpoints[0]["generalization_score"] < self.top_checkpoints[1]["generalization_score"] * 1.05  # Within 5% of each other
-            )
-            
-            if use_interpolation:
-                print(f"DECISIVE: Interpolating top 2 checkpoints for better generalization", flush=True)
-                ckpt1 = self.top_checkpoints[0]
-                ckpt2 = self.top_checkpoints[1]
-                print(f"  Checkpoint 1: step={ckpt1['step']}, gen_score={ckpt1['generalization_score']:.6f}, eval_loss={ckpt1['eval_loss']:.6f}", flush=True)
-                print(f"  Checkpoint 2: step={ckpt2['step']}, gen_score={ckpt2['generalization_score']:.6f}, eval_loss={ckpt2['eval_loss']:.6f}", flush=True)
-                
-                # Interpolate weights: 0.6 * best + 0.4 * second_best
-                # (Best checkpoint gets more weight)
-                weight1, weight2 = 0.6, 0.4
-                
-                try:
-                    # Load both checkpoints
-                    ckpt1_path = os.path.join(self.output_dir, f"checkpoint-{ckpt1['step']}")
-                    ckpt2_path = os.path.join(self.output_dir, f"checkpoint-{ckpt2['step']}")
-                    
-                    # Check if both checkpoints exist
-                    if os.path.exists(ckpt1_path) and os.path.exists(ckpt2_path):
-                        # Load state dicts
-                        import glob
-                        try:
-                            from safetensors.torch import load_file, save_file
-                            has_safetensors = True
-                        except ImportError:
-                            has_safetensors = False
-                            print(f"  Warning: safetensors not available, using .bin files only", flush=True)
-                        
-                        # Find model files (could be .bin or .safetensors)
-                        ckpt1_files = glob.glob(os.path.join(ckpt1_path, "*.safetensors"))
-                        if not ckpt1_files:
-                            ckpt1_files = glob.glob(os.path.join(ckpt1_path, "*.bin"))
-                        
-                        if ckpt1_files:
-                            # Copy first checkpoint as base
-                            shutil.copytree(ckpt1_path, self.submission_dir)
-                            
-                            # Interpolate weights
-                            print(f"  Interpolating weights: {weight1} * ckpt1 + {weight2} * ckpt2", flush=True)
-                            for file_path in ckpt1_files:
-                                filename = os.path.basename(file_path)
-                                file1_path = os.path.join(ckpt1_path, filename)
-                                file2_path = os.path.join(ckpt2_path, filename)
-                                output_path = os.path.join(self.submission_dir, filename)
-                                
-                                if os.path.exists(file2_path):
-                                    # Load both state dicts
-                                    if filename.endswith(".safetensors") and has_safetensors:
-                                        state1 = load_file(file1_path)
-                                        state2 = load_file(file2_path)
-                                    else:
-                                        state1 = torch.load(file1_path, map_location="cpu")
-                                        state2 = torch.load(file2_path, map_location="cpu")
-                                    
-                                    # Interpolate
-                                    interpolated = {}
-                                    for key in state1.keys():
-                                        if key in state2 and state1[key].shape == state2[key].shape:
-                                            interpolated[key] = weight1 * state1[key] + weight2 * state2[key]
-                                        else:
-                                            interpolated[key] = state1[key]  # Use ckpt1 if key missing in ckpt2
-                                    
-                                    # Save interpolated weights
-                                    if filename.endswith(".safetensors") and has_safetensors:
-                                        save_file(interpolated, output_path)
-                                    else:
-                                        torch.save(interpolated, output_path)
-                            
-                            print(f"  Successfully interpolated checkpoints", flush=True)
-                            interpolation_info = f"interpolated:step1={ckpt1['step']},step2={ckpt2['step']},w1={weight1},w2={weight2}"
+            # OPTIMIZATION: Check remaining time before interpolation
+            # Interpolation takes extra time, so only do it if we have enough time
+            should_interpolate = False
+            if self._should_use_interpolation():
+                # Check if we have enough time for interpolation (takes ~2-3x longer than simple copy)
+                if self.end_time:
+                    try:
+                        end_time_obj = datetime.datetime.strptime(self.end_time, "%Y-%m-%d %H:%M:%S")
+                        end_time_obj = end_time_obj.replace(tzinfo=timezone.utc)
+                        now = datetime.datetime.now(timezone.utc)
+                        remaining_minutes = (end_time_obj - now).total_seconds() / 60
+                        # Only interpolate if we have at least 15 minutes remaining
+                        if remaining_minutes >= 15:
+                            should_interpolate = True
                         else:
-                            # Fallback: just use best checkpoint
-                            print(f"  Warning: Could not find model files, using best checkpoint only", flush=True)
-                            shutil.copytree(
-                                os.path.join(self.output_dir, f"checkpoint-{self.best_checkpoint_info['step']}"),
-                                self.submission_dir
-                            )
-                            interpolation_info = "single_best"
-                    else:
-                        # Fallback: just use best checkpoint
-                        print(f"  Warning: Checkpoints not found, using best checkpoint only", flush=True)
-                        shutil.copytree(
-                            os.path.join(self.output_dir, f"checkpoint-{self.best_checkpoint_info['step']}"),
-                            self.submission_dir
-                        )
-                        interpolation_info = "single_best"
+                            print(f"  Skipping interpolation - only {remaining_minutes:.1f} min remaining (need 15+ min)", flush=True)
+                    except:
+                        should_interpolate = True  # If time check fails, try interpolation anyway
+                else:
+                    should_interpolate = True
+            
+            # DECISIVE: Checkpoint interpolation - use top 2 checkpoints if available
+            if should_interpolate:
+                try:
+                    interpolation_info = self._interpolate_checkpoints(
+                        self.top_checkpoints[0],
+                        self.top_checkpoints[1]
+                    )
                 except Exception as e:
                     # Fallback: just use best checkpoint if interpolation fails
                     print(f"  Warning: Interpolation failed ({e}), using best checkpoint only", flush=True)
-                    if os.path.exists(self.submission_dir):
-                        try:
-                            # Use ignore_errors=True to handle FileNotFoundError and other errors gracefully
-                            shutil.rmtree(self.submission_dir, ignore_errors=True)
-                        except Exception as err:
-                            # Catch all exceptions to prevent crashes from file system issues
-                            print(f"Warning: Error removing submission directory (ignoring): {err}", flush=True)
-                            # Try to continue even if removal failed
-                            try:
-                                import stat
-                                def handle_remove_readonly(func, path, exc):
-                                    if os.path.exists(path):
-                                        os.chmod(path, stat.S_IWRITE)
-                                        func(path)
-                                shutil.rmtree(self.submission_dir, onerror=handle_remove_readonly)
-                            except Exception:
-                                # If all else fails, just continue
-                                pass
-                    shutil.copytree(
-                        os.path.join(self.output_dir, f"checkpoint-{self.best_checkpoint_info['step']}"),
-                        self.submission_dir
-                    )
+                    safe_remove_directory(self.submission_dir)
+                    self._copy_best_checkpoint()
                     interpolation_info = "single_best"
             else:
                 # Use single best checkpoint (with generalization_score)
                 print(f"Using best checkpoint (generalization_score={best_gen_score:.6f}, eval_loss={best_eval_loss:.6f})", flush=True)
-                shutil.copytree(
-                    os.path.join(self.output_dir, f"checkpoint-{self.best_checkpoint_info['step']}"),
-                    self.submission_dir
-                )
+                self._copy_best_checkpoint()
                 interpolation_info = "single_best"
             
             self.update_best_checkpoint = False
@@ -605,7 +909,7 @@ class CustomEvalSaveCallback(TrainerCallback):
 
 
 class GRPOCustomEvalSaveCallback(CustomEvalSaveCallback):
-    def compute_loss(self, state: TrainerState, metrics):
+    def compute_loss(self, state: TrainerState, metrics: Dict[str, Any]) -> Optional[float]:
         eval_loss = None
         if state.log_history:
             last_log_entry = state.log_history[-1]
@@ -619,7 +923,7 @@ class GRPOCustomEvalSaveCallback(CustomEvalSaveCallback):
             
         return eval_loss
     
-    def penalize_eval_loss(self, eval_loss: float):
+    def penalize_eval_loss(self, eval_loss: float) -> float:
         if eval_loss < 0:
             return eval_loss / 3
         else:
@@ -659,9 +963,9 @@ class WhenToEvalHandler:
                 remaining_minutes = (end_time_obj - now).total_seconds() / 60
                 
                 # Adjust mode based on remaining time
-                if remaining_minutes < 30:  # Less than 30 minutes
+                if remaining_minutes < TIME_TIGHT_THRESHOLD:
                     self.time_aware_mode = "tight"
-                elif remaining_minutes > 120:  # More than 2 hours
+                elif remaining_minutes > TIME_AMPLE_THRESHOLD:
                     self.time_aware_mode = "ample"
                 else:
                     self.time_aware_mode = "normal"
@@ -678,19 +982,19 @@ class WhenToEvalHandler:
             
             # In tight time mode, evaluate more frequently to catch best checkpoint quickly
             if self.time_aware_mode == "tight":
-                if progress > 0.7:  # Last 30% of training
-                    if global_step % 30 == 0 and global_step > 1:  # Very frequent
+                if progress > PROGRESS_THRESHOLD_TIGHT_70:  # Last 30% of training
+                    if global_step % EVAL_FREQUENT_STEPS_TIGHT == 0 and global_step > 1:
                         return {"eval": True, "reason": "periodic_frequent_tight"}
-                elif progress > 0.5:  # Last 50% of training
-                    if global_step % 50 == 0 and global_step > 1:
+                elif progress > PROGRESS_THRESHOLD_TIGHT_50:  # Last 50% of training
+                    if global_step % EVAL_FREQUENT_STEPS_NORMAL == 0 and global_step > 1:
                         return {"eval": True, "reason": "periodic_frequent_tight"}
-            elif progress > 0.8:  # Last 20% of training
-                # Evaluate every 50 steps (very frequent to catch best checkpoint)
-                if global_step % 50 == 0 and global_step > 1:
+            elif progress > PROGRESS_THRESHOLD_FREQUENT:  # Last 20% of training
+                # Evaluate every N steps (very frequent to catch best checkpoint)
+                if global_step % EVAL_FREQUENT_STEPS_NORMAL == 0 and global_step > 1:
                     return {"eval": True, "reason": "periodic_frequent"}
-            elif progress > 0.6:  # Last 40% of training
-                # Evaluate every 100 steps (moderately frequent)
-                if global_step % 100 == 0 and global_step > 1:
+            elif progress > PROGRESS_THRESHOLD_MODERATE:  # Last 40% of training
+                # Evaluate every N steps (moderately frequent)
+                if global_step % EVAL_MODERATE_STEPS == 0 and global_step > 1:
                     return {"eval": True, "reason": "periodic_frequent"}
         
         if self.periodic_save_steps != -1 and global_step % self.periodic_save_steps == 0 and global_step > 1:
@@ -963,15 +1267,62 @@ class EarlyStoppingCallback(TrainerCallback):
     Early stopping callback to prevent overfitting.
     Stops training when eval_loss doesn't improve for 'patience' evaluations.
     Works with both standard eval_loss and GRPO's eval_reward (negated).
+    
+    Patience is adaptive based on remaining time and training progress.
     """
-    def __init__(self, patience: int = 300, min_delta: float = 0.0001):
-        self.patience = patience
+    def __init__(self, patience: int = 300, min_delta: float = 0.0001, end_time: str = "", max_steps: int = -1):
+        self.base_patience = patience
+        self.patience = patience  # Will be adjusted adaptively
         self.min_delta = min_delta
         self.best_loss = None
         self.wait = 0
         self.stopped_epoch = 0
+        self.end_time = end_time
+        self.max_steps = max_steps
+        self.eval_times = []  # Track evaluation times to estimate overhead
+    
+    def _calculate_adaptive_patience(self, state) -> int:
+        """
+        Calculate adaptive patience based on remaining time and training progress.
+        In tight time situations, use lower patience to save time.
+        In early training, use lower patience to avoid wasting time on poor runs.
+        """
+        base_patience = self.base_patience
+        
+        # Adjust based on remaining time
+        if self.end_time:
+            try:
+                end_time_obj = datetime.datetime.strptime(self.end_time, "%Y-%m-%d %H:%M:%S")
+                end_time_obj = end_time_obj.replace(tzinfo=timezone.utc)
+                now = datetime.datetime.now(timezone.utc)
+                remaining_minutes = (end_time_obj - now).total_seconds() / 60
+                
+                # In tight time (< 30 min), reduce patience significantly
+                if remaining_minutes < 30:
+                    base_patience = max(10, int(base_patience * 0.2))  # 20% of base, min 10
+                elif remaining_minutes < 60:
+                    base_patience = max(20, int(base_patience * 0.4))  # 40% of base, min 20
+                elif remaining_minutes < 120:
+                    base_patience = int(base_patience * 0.6)  # 60% of base
+            except:
+                pass
+        
+        # Adjust based on training progress
+        if self.max_steps > 0:
+            progress = state.global_step / self.max_steps
+            # Early in training: lower patience (don't waste time on bad runs)
+            if progress < 0.2:
+                base_patience = max(15, int(base_patience * 0.5))
+            # Late in training: higher patience (might be near convergence)
+            elif progress > 0.8:
+                base_patience = int(base_patience * 1.2)
+        
+        return base_patience
     
     def on_evaluate(self, args, state, control, metrics, **kwargs):
+        # Update adaptive patience
+        self.patience = self._calculate_adaptive_patience(state)
+        
         # Try to get eval_loss first, then eval_reward (for GRPO)
         eval_loss = metrics.get("eval_loss", None)
         if eval_loss is None and state.log_history:
@@ -991,7 +1342,7 @@ class EarlyStoppingCallback(TrainerCallback):
             # Significant improvement
             self.best_loss = eval_loss
             self.wait = 0
-            print(f"Early stopping: Improved eval_loss to {eval_loss:.6f} (best: {self.best_loss:.6f}), resetting patience counter", flush=True)
+            print(f"Early stopping: Improved eval_loss to {eval_loss:.6f} (best: {self.best_loss:.6f}), resetting patience counter (patience={self.patience})", flush=True)
         else:
             # No improvement
             self.wait += 1

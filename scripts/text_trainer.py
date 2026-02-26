@@ -15,6 +15,7 @@ import uuid
 import re
 import time 
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 import yaml
 from transformers import AutoTokenizer
@@ -130,7 +131,7 @@ def get_error_type(log_path: str):
         return None
 
 
-def extract_output_dir(train_cmd: str) -> str:
+def extract_output_dir(train_cmd: str) -> Optional[str]:
     match = re.search(r"--output_dir\s+(.*?)\s+", train_cmd)
     if match:
         return match.group(1)
@@ -159,6 +160,9 @@ def run_training(
     for i in range(retries):
         print(f"************* Training attempt {i+1}/{retries} for task {task_id}*************", flush=True)
         if i > 0:  # there was something wrong so we will reduce the batch_size
+            # Note: This OOM reduction handles catastrophic failures before training starts.
+            # ProgressiveBatchSizeCallback (enabled via use_progressive_batch_size) handles
+            # gradual batch size increases during successful training runs.
             # first check if the training is OOM
             if os.path.exists(log_path):
                 error_type = get_error_type(log_path)
@@ -166,31 +170,38 @@ def run_training(
                     current_batch_size = extract_value_from_cmd(
                         train_cmd, "per_device_train_batch_size"
                     )
-                    current_batch_size = int(current_batch_size)
-                    if current_batch_size > 1:
-                        new_batch_size = current_batch_size // 2
-                        print(
-                            f"Reducing batch size from {current_batch_size} to {new_batch_size}",
-                            flush=True,
-                        )
-                        train_cmd = replace_args_in_cmd(
-                            train_cmd,
-                            "per_device_train_batch_size",
-                            str(new_batch_size),
-                        )
-                        # print(f"New train command: {train_cmd}", flush=True)
-                    else:
-                        print(f"batch size is 1, cannot reduce further", flush=True)
-                        if task_type == TaskType.GRPOTASK.value:
-                            # disable vllm
-                            train_cmd = replace_args_in_cmd(
-                                train_cmd, "use_vllm", "False"
+                    if current_batch_size:
+                        current_batch_size = int(current_batch_size)
+                        if current_batch_size > 1:
+                            new_batch_size = current_batch_size // 2
+                            print(
+                                f"OOM detected: Reducing batch size from {current_batch_size} to {new_batch_size} (ProgressiveBatchSizeCallback will handle increases during training)",
+                                flush=True,
                             )
-                            # print(f"disable VLLM {train_cmd}", flush=True)
+                            new_cmd = replace_args_in_cmd(
+                                train_cmd,
+                                "per_device_train_batch_size",
+                                str(new_batch_size),
+                            )
+                            if new_cmd is not None:
+                                train_cmd = new_cmd
+                            # print(f"New train command: {train_cmd}", flush=True)
+                        else:
+                            print(f"batch size is 1, cannot reduce further", flush=True)
+                            if task_type == TaskType.GRPOTASK.value:
+                                # disable vllm
+                                new_cmd = replace_args_in_cmd(
+                                    train_cmd, "use_vllm", "False"
+                                )
+                                if new_cmd is not None:
+                                    train_cmd = new_cmd
+                                # print(f"disable VLLM {train_cmd}", flush=True)
                 elif error_type == VLLM_OOM_ERROR:
                     if task_type == TaskType.GRPOTASK.value:
                         print(f"VLLM OOM error, disable VLLM", flush=True)
-                        train_cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False")
+                        new_cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False")
+                        if new_cmd is not None:
+                            train_cmd = new_cmd
 
         # empty the log file if it exists
         if os.path.exists(log_path):
@@ -253,8 +264,75 @@ def patch_wandb_symlinks(base_dir: str):
                     pathlib.Path(full_path).touch()
 
 
+def _select_best_checkpoint(train_runs: list[dict]) -> tuple[int, float, str]:
+    """
+    Select the best checkpoint from training runs with improved tie-breaking logic.
+    
+    Selection strategy:
+    1. Primary: Use eval_loss if available (better generalization indicator)
+    2. Tie-breaking: If losses are equal (within 0.1%), prefer:
+       - Lower train_loss (less overfitting)
+       - Earlier run index (more training time remaining)
+    
+    Args:
+        train_runs: List of training run dictionaries
+        
+    Returns:
+        Tuple of (index, selected_loss, loss_type) where loss_type is 'eval_loss' or 'train_loss'
+    """
+    if not train_runs:
+        raise ValueError("Cannot select best checkpoint from empty list")
+    
+    if all("current_eval_loss" in run for run in train_runs):
+        # Use eval_loss for selection (much better than train_loss)
+        losses_for_selection = [run.get("current_eval_loss", run["current_loss"]) for run in train_runs]
+        min_loss = min(losses_for_selection)
+        
+        # Find all runs with minimum loss (within 0.1% tolerance for floating point)
+        epsilon = min_loss * 0.001
+        candidates = [
+            (i, run) for i, (loss, run) in enumerate(zip(losses_for_selection, train_runs))
+            if abs(loss - min_loss) <= epsilon
+        ]
+        
+        if len(candidates) == 1:
+            index = candidates[0][0]
+        else:
+            # Tie-breaking: prefer run with lower train_loss, then earlier index
+            candidates.sort(key=lambda x: (x[1]["current_loss"], x[0]))
+            index = candidates[0][0]
+            print(f"Tie-breaking: {len(candidates)} runs with similar eval_loss, selected index {index} (train_loss={candidates[0][1]['current_loss']:.6f})", flush=True)
+        
+        selected_loss = train_runs[index]["current_eval_loss"]
+        return index, selected_loss, "eval_loss"
+    else:
+        # Fallback to current_loss if eval_loss not available (backward compatibility)
+        losses_for_selection = [run["current_loss"] for run in train_runs]
+        min_loss = min(losses_for_selection)
+        
+        # Find all runs with minimum loss (within 0.1% tolerance)
+        epsilon = min_loss * 0.001
+        candidates = [
+            i for i, loss in enumerate(losses_for_selection)
+            if abs(loss - min_loss) <= epsilon
+        ]
+        
+        # If tie, prefer earlier run (more training time remaining)
+        index = min(candidates) if candidates else np.argmin(losses_for_selection)
+        
+        selected_loss = train_runs[index]["current_loss"]
+        return index, selected_loss, "train_loss"
+
+
 def delete_poor_checkpoints(train_runs: list[dict]):
-    # Use eval_loss for deletion if available, otherwise use current_loss
+    """
+    Delete checkpoints that are not the best.
+    Uses eval_loss for comparison if available, otherwise uses current_loss.
+    """
+    if not train_runs:
+        return
+    
+    # Get losses for comparison
     if all("current_eval_loss" in run for run in train_runs):
         # Use eval_loss for better checkpoint management
         losses_for_comparison = [run.get("current_eval_loss", run["current_loss"]) for run in train_runs]
@@ -593,6 +671,12 @@ def main():
         "reg_ratio": args.reg_ratio,
         "find_lk_lr": True,
         "checking_mode": "first_time",
+        # Enable progressive batch size scaling strategy:
+        # Start with 16 or 32, confirm training is stable, increase until near memory limit,
+        # scale learning rate proportionally, stop when speed improvement is small or validation accuracy drops
+        "use_progressive_batch_size": True,
+        "max_batch_size": 128,  # Maximum batch size for progressive scaling
+        "stability_steps": 50,  # Steps to confirm training stability before increasing batch size
     }
 
     if (args.task_type == TaskType.INSTRUCTTEXTTASK.value or args.task_type == TaskType.CHATTASK.value):
@@ -629,10 +713,24 @@ def main():
     # at first the state is always running the train_cmd
 
     set_state(state)
-    # TODO Run something magic here
     count = 0
-    while True:
+    max_iterations = 20  # Safety limit to prevent infinite loops
+    while count < max_iterations:
         state = get_state()
+        
+        # Validate state structure
+        if not isinstance(state, dict):
+            print(f"ERROR: Invalid state type: {type(state)}, resetting to initial", flush=True)
+            state = {"mode": "initial"}
+            set_state(state)
+        
+        # Validate mode
+        valid_modes = ["initial", "continue", "finish"]
+        if state.get("mode") not in valid_modes:
+            print(f"ERROR: Invalid mode '{state.get('mode')}', resetting to initial", flush=True)
+            state["mode"] = "initial"
+            set_state(state)
+        
         train_cmd = original_train_cmd  # will replace based on the state later
         c_train_info = copy.deepcopy(train_info)
         final_output_dir = None
@@ -647,8 +745,23 @@ def main():
                 c_train_info["train_request"]["checking_mode"] = "second_time"
                 n_runs = state["next_runs"]
                 if "lrs" not in state: # first time of continue
+                    if "train" not in state or "lr" not in state.get("train", {}):
+                        print(f"Error: Missing 'train' or 'lr' in state, cannot continue. State keys: {list(state.keys())}", flush=True)
+                        state["mode"] = "finish"
+                        set_state(state)
+                        break
                     current_lr = float(state["train"]["lr"])
-                    state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
+                    
+                    # Improved LR exploration: if we have previous run results, use them to guide exploration
+                    # Otherwise, use standard log-scale extension
+                    if "runs" in state and len(state.get("runs", [])) > 0:
+                        # We have previous results - could use them for smarter exploration
+                        # For now, use standard extension but could be enhanced
+                        state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
+                    else:
+                        # First time: standard exploration
+                        state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
+                    
                     assert len(state["lrs"]) == n_runs, f"Number of learning rates {state['lrs']} should be equal to number of runs {n_runs}"
                     state["runs"] = []
                 
@@ -658,22 +771,13 @@ def main():
                 if len(state["runs"]) < n_runs:
                     index = len(state["runs"])
                     current_lr = state["lrs"][index]
-                    train_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
+                    new_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
+                    if new_cmd is not None:
+                        train_cmd = new_cmd
                 else: # the final run - continue training the best checkpoint to completion
-                    # CRITICAL: Use eval_loss for selection if available, otherwise fall back to current_loss
-                    # This is the key improvement - eval_loss is what matters for generalization
-                    if all("current_eval_loss" in run for run in state["runs"]):
-                        # Use eval_loss for selection (much better than train_loss)
-                        losses_for_selection = [run.get("current_eval_loss", run["current_loss"]) for run in state["runs"]]
-                        index = np.argmin(losses_for_selection)
-                        selected_loss = state["runs"][index]["current_eval_loss"]
-                        print(f"BL (using eval_loss);{index};eval_loss={selected_loss:.6f};train_loss={state['runs'][index]['current_loss']:.6f};lr={state['lrs'][index]}", flush=True)
-                    else:
-                        # Fallback to current_loss if eval_loss not available (backward compatibility)
-                        losses_for_selection = [run["current_loss"] for run in state["runs"]]
-                        index = np.argmin(losses_for_selection)
-                        selected_loss = state["runs"][index]["current_loss"]
-                        print(f"BL (using train_loss fallback);{index};{selected_loss:.6f}; {state['lrs'][index]}", flush=True)
+                    # Select best checkpoint based on eval_loss if available, otherwise train_loss
+                    index, selected_loss, loss_type = _select_best_checkpoint(state["runs"])
+                    print(f"BL (using {loss_type});{index};{loss_type}={selected_loss:.6f};train_loss={state['runs'][index]['current_loss']:.6f};lr={state['lrs'][index]}", flush=True)
                     
                     c_train_info["train_request"]["checking_mode"] = "none"
                     # Use the best checkpoint's train_cmd and output_dir
@@ -682,7 +786,9 @@ def main():
                     final_output_dir = state["runs"][index]["output_dir"]
                     state["mode"] = "finish"
             else: # the state = finish; no need to run more
-                assert state["mode"] == "finish"
+                if state["mode"] != "finish":
+                    print(f"WARNING: Expected mode 'finish' but got '{state['mode']}', setting to finish", flush=True)
+                    state["mode"] = "finish"
                 break
         
         set_state(state)
@@ -692,13 +798,17 @@ def main():
                 run_output_dir = final_output_dir
             else:
                 run_output_dir = output_dir + f"_{count}"
-            train_cmd = replace_args_in_cmd(train_cmd, "output_dir", run_output_dir)
+            new_cmd = replace_args_in_cmd(train_cmd, "output_dir", run_output_dir)
+            if new_cmd is not None:
+                train_cmd = new_cmd
             
             current_request_path = os.path.join(ds_folder, f"training_request_{args.task_id}_{count}.json")
             with open(current_request_path, "w") as f:
                 json.dump(c_train_info, f, indent=4, ensure_ascii=False)
             
-            train_cmd = replace_args_in_cmd(train_cmd, "request_path", current_request_path)
+            new_cmd = replace_args_in_cmd(train_cmd, "request_path", current_request_path)
+            if new_cmd is not None:
+                train_cmd = new_cmd
             
             state["train"] = {
                 "train_cmd": train_cmd,

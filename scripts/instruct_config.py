@@ -87,36 +87,50 @@ for key in INSTRUCT_CONFIG:
 
 
 def get_instruct_config(param_nums: int) -> dict:
-    result = {
-        "lr": 4e-5,
-        "distributed": "ds",
-        "gpu_count": 8,
-        "batch_size": 6,
-        "use_lora": True,
-    }
-    if param_nums < 1_000_000_000:
-        result = INSTRUCT_CONFIG["0_1_b"]
-    elif param_nums < 2_000_000_000:
-        result = INSTRUCT_CONFIG["1_2_b"]
-    elif param_nums < 4_000_000_000:
-        result = INSTRUCT_CONFIG["2_4_b"]
-    elif param_nums < 5_000_000_000:
-        result = INSTRUCT_CONFIG["4_5_b"]
-    elif param_nums < 9_000_000_000:
-        result = INSTRUCT_CONFIG["5_9_b"]
-    elif param_nums < 12_000_000_000:
-        result = INSTRUCT_CONFIG["9_12_b"]
-    elif param_nums < 15_000_000_000:
-        result = INSTRUCT_CONFIG["12_15_b"]
-    elif param_nums < 35_000_000_000:
-        result = INSTRUCT_CONFIG["15_40_b"]
-    elif param_nums < 80_000_000_000:
-        result = INSTRUCT_CONFIG["40_80_b"]
-    else:
-        print(f"Model size {param_nums} is not supported")
+    """
+    Get Instruct configuration based on model parameter count.
+    
+    Uses a sorted list of thresholds for efficient lookup.
+    """
+    # Define size thresholds in ascending order (in billions)
+    size_thresholds = [
+        (1, "0_1_b"),
+        (2, "1_2_b"),
+        (4, "2_4_b"),
+        (5, "4_5_b"),
+        (9, "5_9_b"),
+        (12, "9_12_b"),
+        (15, "12_15_b"),
+        (35, "15_40_b"),
+        (80, "40_80_b"),
+    ]
+    
+    param_nums_b = param_nums / 1_000_000_000  # Convert to billions
+    
+    # Find appropriate config
+    result = None
+    for threshold_b, config_key in size_thresholds:
+        if param_nums_b < threshold_b:
+            result = INSTRUCT_CONFIG[config_key]
+            break
+    
+    # Fallback for very large models
+    if result is None:
+        print(f"Model size {param_nums} ({param_nums_b:.1f}B) is not supported, using default config")
+        result = {
+            "lr": 4e-5,
+            "distributed": "ds",
+            "gpu_count": 8,
+            "batch_size": 6,
+            "use_lora": True,
+        }
+    
     result = deepcopy(result)
-    if param_nums < 9_000_000_000 and param_nums > 8_000_000_000:
+    
+    # Apply batch size adjustment for specific size range (8-9B models)
+    if 8.0 < param_nums_b < 9.0:
         result["batch_size"] = int(2 * result["batch_size"] / 3)
+    
     return result
 
 
