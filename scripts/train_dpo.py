@@ -25,7 +25,7 @@ from peft import (
 from transformers import TrainerCallback
 import argparse
 import os
-from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb, EarlyStoppingCallback, ProgressiveBatchSizeCallback
+from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb, EarlyStoppingCallback
 from state_manager import get_state, set_state
 
 # from packing.packed_dataset import PackedDataset
@@ -293,48 +293,6 @@ def main():
         checking_step = total_steps_per_epoch - 2
     
 
-    # Build callbacks list
-    callbacks = [
-        CustomEvalSaveCallback(
-            WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
-            train_request["submission_dir"],
-            training_args.output_dir,
-            train_request["model_name"],
-            max_steps,
-            checking_step=checking_step,
-            total_steps_all_epochs=total_steps_all_epochs,
-            end_time=train_request["end_time"],
-            checking_mode=train_request.get("checking_mode", "none")
-        ),
-        EarlyStoppingCallback(patience=300, min_delta=0.0001, end_time=train_request.get("end_time", ""), max_steps=max_steps)
-    ]
-    
-    # Add progressive batch size callback if enabled
-    use_progressive_batch_size = train_request.get("use_progressive_batch_size", True)
-    if use_progressive_batch_size:
-        # Set initial batch size to 16 or 32
-        initial_batch_size = 16
-        if training_args.per_device_train_batch_size > initial_batch_size:
-            log_info(
-                f"ProgressiveBatchSize: Setting initial batch size to {initial_batch_size} (was {training_args.per_device_train_batch_size})"
-            )
-            training_args.per_device_train_batch_size = initial_batch_size
-        
-        max_batch_size = train_request.get("max_batch_size", 128)
-        stability_steps = train_request.get("stability_steps", 50)
-        callbacks.append(
-            ProgressiveBatchSizeCallback(
-                initial_batch_size=training_args.per_device_train_batch_size,
-                max_batch_size=max_batch_size,
-                stability_steps=stability_steps,
-                min_speed_improvement=0.05,
-                eval_accuracy_drop_threshold=0.01,
-                batch_size_multiplier=1.5,
-                memory_safety_margin=0.9
-            )
-        )
-        log_info(f"ProgressiveBatchSize: Enabled with initial_batch_size={training_args.per_device_train_batch_size}, max_batch_size={max_batch_size}")
-    
     trainer = DPOTrainer(
         model=model,
         ref_model=ref_model,
@@ -343,7 +301,20 @@ def main():
         eval_dataset=dev_ds,
         processing_class=tokenizer,
         peft_config=peft_config,
-        callbacks=callbacks,
+        callbacks=[
+            CustomEvalSaveCallback(
+                WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
+                train_request["submission_dir"],
+                training_args.output_dir,
+                train_request["model_name"],
+                max_steps,
+                checking_step=checking_step,
+                total_steps_all_epochs=total_steps_all_epochs,
+                end_time=train_request["end_time"],
+                checking_mode=train_request.get("checking_mode", "none")
+            ),
+            EarlyStoppingCallback(patience=300, min_delta=0.0001, hours_to_complete=train_request.get("hours_to_complete"))
+        ],
     )
     
     print("Start training ...", flush=True)

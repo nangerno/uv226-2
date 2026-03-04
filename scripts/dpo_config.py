@@ -83,37 +83,29 @@ for key in DPO_CONFIG:
     
 
 def get_config(param_nums: int) -> dict:
-    """
-    Get DPO configuration based on model parameter count.
-    
-    Uses a sorted list of thresholds for efficient lookup.
-    """
-    # Define size thresholds in ascending order (in billions)
-    size_thresholds = [
-        (1, "0_1_b"),
-        (2, "1_2_b"),
-        (4, "2_4_b"),
-        (5, "4_5_b"),
-        (9, "5_9_b"),
-        (12, "9_12_b"),
-        (14, "12_14_b"),
-        (15, "14_15_b"),
-        (35, "15_40_b"),
-        (80, "40_80_b"),
-    ]
-    
-    param_nums_b = param_nums / 1_000_000_000  # Convert to billions
-    
-    # Find appropriate config
     result = None
-    for threshold_b, config_key in size_thresholds:
-        if param_nums_b < threshold_b:
-            result = DPO_CONFIG[config_key].copy()
-            break
-    
-    # Fallback for very large models
-    if result is None:
-        print(f"Model size {param_nums} ({param_nums_b:.1f}B) is not supported, using default config", flush=True)
+    if param_nums < 1_000_000_000:
+        result = DPO_CONFIG["0_1_b"]
+    elif param_nums < 2_000_000_000:
+        result = DPO_CONFIG["1_2_b"]
+    elif param_nums < 4_000_000_000:
+        result = DPO_CONFIG["2_4_b"]
+    elif param_nums < 5_000_000_000:
+        result = DPO_CONFIG["4_5_b"]
+    elif param_nums < 9_000_000_000:
+        result = DPO_CONFIG["5_9_b"]
+    elif param_nums < 12_000_000_000:
+        result = DPO_CONFIG["9_12_b"]
+    elif param_nums < 14_000_000_000:
+        result = DPO_CONFIG["12_14_b"]
+    elif param_nums < 15_000_000_000:  
+        result = DPO_CONFIG["14_15_b"]
+    elif param_nums < 35_000_000_000:
+        result = DPO_CONFIG["15_40_b"]
+    elif param_nums < 80_000_000_000:
+        result = DPO_CONFIG["40_80_b"]
+    else:
+        print(f"Model size {param_nums} is not supported", flush=True)
         result = {
             "lr": 4e-5,
             "distributed": "ds",
@@ -121,17 +113,14 @@ def get_config(param_nums: int) -> dict:
             "batch_size": 6,
             "use_lora": True
         }
-    
-    # Apply GPU count overrides based on specific size ranges
-    if 1.33 < param_nums_b < 4.0:
+    if param_nums < 4_000_000_000 and param_nums > 1_330_000_000:
         result["gpu_count"] = 2
-    elif param_nums_b > 13.33:
+    if param_nums > 13_330_000_000: # 8 GPUs for 13.3B
         result["gpu_count"] = 8
-    
     return result
 
 
-def get_run_cmd(config: dict, gpu_nums: int):
+def get_run_cmd(config: dict, gpu_nums: int, train_info: dict = None):
     required_keys = [
         "epoch_num",
         "batch_size",
@@ -169,7 +158,7 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --logging_steps 5 \
     --learning_rate {learning_rate} \
     --weight_decay 0.01 \
-    --warmup_steps 35 \
+    --warmup_steps {warmup_steps} \
     --lr_scheduler_type cosine_with_min_lr \
     --lr_scheduler_kwargs "{\\"min_lr_rate\\": {min_lr_rate}}" \
     --tf32 True \
@@ -180,8 +169,21 @@ def get_run_cmd(config: dict, gpu_nums: int):
     )
 
     if config.get("use_lora", False):
+        # Time-aware LoRA rank: Higher rank for short jobs for faster adaptation
+        if train_info:
+            hours_to_complete = float(train_info.get("hours_to_complete", 0) or 0)
+            if hours_to_complete > 0 and hours_to_complete <= 0.75:
+                lora_r, lora_alpha = 256, 512  # Higher rank for very short jobs
+            elif hours_to_complete <= 1.5:
+                lora_r, lora_alpha = 192, 384  # Medium-high rank for short jobs
+            else:
+                lora_r, lora_alpha = 128, 256  # Standard rank for longer jobs
+            if hours_to_complete > 0 and hours_to_complete <= 1.5:
+                print(f"Time-aware LoRA: Using rank {lora_r} (alpha {lora_alpha}) for {hours_to_complete:.2f}h job", flush=True)
+        else:
+            lora_r, lora_alpha = 128, 256  # Default
         template += (
-            " --use_peft --lora_r 128 --lora_alpha 256 --lora_target_modules all-linear"
+            f" --use_peft --lora_r {lora_r} --lora_alpha {lora_alpha} --lora_target_modules all-linear"
         )
 
     if run_type == "ds":
@@ -230,6 +232,31 @@ def get_training_json(train_info: dict) -> dict:
     if total_batch_size < 64:
         run_config["gradient_accumulation_steps"] = min(4, int(64 / total_batch_size))
     
+    # Time-aware optimizations for better results in limited time
+    hours_to_complete = float(train_info.get("hours_to_complete", 0) or 0)
+    warmup_steps = 35  # Default warmup
+    if hours_to_complete > 0:
+        if hours_to_complete <= 0.75:  # Very short jobs
+            # Reduce gradient accumulation for faster updates
+            run_config["gradient_accumulation_steps"] = max(1, run_config["gradient_accumulation_steps"] // 2)
+            # Add label smoothing for better generalization in limited time
+            run_config["label_smoothing_factor"] = 0.1
+            # Reduce epochs
+            run_config["epoch_num"] = 1
+            # Reduce warmup steps to reach effective LR faster
+            warmup_steps = 10
+            print(f"Time-aware optimization: Very short job ({hours_to_complete:.2f}h) - reduced grad_accum, added label_smoothing, 1 epoch, 10 warmup steps", flush=True)
+        elif hours_to_complete <= 1.5:  # Short jobs
+            run_config["gradient_accumulation_steps"] = max(1, int(run_config["gradient_accumulation_steps"] * 0.75))
+            run_config["label_smoothing_factor"] = 0.05
+            run_config["epoch_num"] = 2
+            warmup_steps = 20
+            print(f"Time-aware optimization: Short job ({hours_to_complete:.2f}h) - adjusted grad_accum, light label_smoothing, 2 epochs, 20 warmup steps", flush=True)
+        else:  # Longer jobs - use standard settings
+            run_config["label_smoothing_factor"] = 0.0  # Keep default for longer jobs
+    
+    run_config["warmup_steps"] = warmup_steps
+    
     if train_info["find_lk_lr"]:
         # get lr from lrs_lookup.py
         lr = get_dpo_lr(model_name)
@@ -242,7 +269,7 @@ def get_training_json(train_info: dict) -> dict:
     base_lr = run_config["learning_rate"]
     run_config["learning_rate"] *= train_info["reg_ratio"]
     print(f"Applied reg_ratio: {base_lr:.8f} * {train_info['reg_ratio']:.6f} = {run_config['learning_rate']:.8f}", flush=True)
-    run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
+    run_cmd = get_run_cmd(run_config, run_config["gpu_nums"], train_info)
     if run_config["disable_fa"] == "False":
         run_cmd = run_cmd + " --padding_free True"
     train_request = deepcopy(train_info)

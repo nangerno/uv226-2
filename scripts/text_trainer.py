@@ -15,7 +15,6 @@ import uuid
 import re
 import time 
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Tuple
 
 import yaml
 from transformers import AutoTokenizer
@@ -96,23 +95,57 @@ def extract_value_from_cmd(cmd: str, arg_name: str):
         return None
 
 
-def get_model_architecture(model_name: str) -> str:
+def get_model_architecture(model_name: str, model_path: str = None) -> str:
+    """
+    Get model architecture, trying local path first to avoid network calls.
+    
+    Args:
+        model_name: HuggingFace model ID (e.g., "microsoft/Phi-3-mini-128k-instruct")
+        model_path: Optional local path to the model directory
+    """
+    # First, try local path if provided and exists
+    if model_path and os.path.exists(model_path):
+        try:
+            config = AutoConfig.from_pretrained(model_path, local_files_only=True)
+            architectures = config.architectures
+            if len(architectures) > 1:
+                return "Multiple architectures"
+            return architectures[0].strip().lower()
+        except Exception as e:
+            # If local fails, continue to try remote (but with better error handling)
+            print(f"Failed to load config from local path {model_path}: {e}", flush=True)
+    
+    # Try with model_name (may download from HuggingFace)
+    # Only attempt network call if we have network connectivity
     try:
-        config = AutoConfig.from_pretrained(model_name)
+        config = AutoConfig.from_pretrained(model_name, local_files_only=False)
         architectures = config.architectures
         if len(architectures) > 1:
             return "Multiple architectures"
         return architectures[0].strip().lower()
     except Exception as e:
+        # Handle network errors gracefully - don't fail the entire script
+        error_str = str(e).lower()
+        if any(err in error_str for err in ["name resolution", "failed to resolve", "connection", "network", "dns", "maxretryerror", "temporary failure"]):
+            print(f"Network error when trying to fetch model config for {model_name}: {e}", flush=True)
+            print("Falling back to 'Unknown' architecture (will use defaults). Model config will be loaded later from local path.", flush=True)
+            return "Unknown"
         if "model type `gpt_oss`" in str(e):
             return "GptOssForCausalLM"
+        print(f"Error getting model architecture for {model_name}: {e}", flush=True)
         return "Unknown"
 
 
-def is_openai_model(model_name: str) -> bool:
-    architecture = get_model_architecture(model_name)
+def is_openai_model(model_name: str, model_path: str = None) -> bool:
+    """
+    Check if model is an OpenAI-style model. Returns False if architecture cannot be determined
+    (e.g., due to network issues), to avoid blocking the training process.
+    """
+    architecture = get_model_architecture(model_name, model_path)
     if architecture.lower() == "gptossforcausallm":
         return True
+    # If architecture is Unknown (e.g., due to network error), default to False
+    # The model will be checked again later when the local path is available
     return False
 
 
@@ -131,55 +164,12 @@ def get_error_type(log_path: str):
         return None
 
 
-def extract_output_dir(train_cmd: str) -> Optional[str]:
+def extract_output_dir(train_cmd: str) -> str:
     match = re.search(r"--output_dir\s+(.*?)\s+", train_cmd)
     if match:
         return match.group(1)
     else:
         return None
-
-
-def check_memory_before_training(batch_size: Optional[int] = None) -> Tuple[bool, str]:
-    """
-    Proactively check GPU memory availability before training starts.
-    
-    Args:
-        batch_size: Current batch size (optional, for recommendations)
-    
-    Returns:
-        Tuple of (is_safe, message)
-    """
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            return True, "CUDA not available, skipping memory check"
-        
-        device = torch.cuda.current_device()
-        memory_allocated = torch.cuda.memory_allocated(device) / (1024**3)  # GB
-        memory_reserved = torch.cuda.memory_reserved(device) / (1024**3)  # GB
-        memory_total = torch.cuda.get_device_properties(device).total_memory / (1024**3)  # GB
-        memory_free = memory_total - memory_reserved
-        
-        usage_ratio = memory_reserved / memory_total
-        
-        message = f"GPU Memory: {memory_reserved:.2f}GB / {memory_total:.2f}GB reserved ({usage_ratio:.1%}), {memory_free:.2f}GB free"
-        
-        # Warn if memory usage is high
-        if usage_ratio > 0.85:
-            recommendation = ""
-            if batch_size and batch_size > 1:
-                recommended_batch = max(1, batch_size // 2)
-                recommendation = f" Consider reducing batch_size to {recommended_batch}"
-            return False, f"WARNING: {message}. High memory usage may cause OOM.{recommendation}"
-        elif usage_ratio > 0.70:
-            return True, f"CAUTION: {message}. Memory usage is moderate."
-        else:
-            return True, message
-            
-    except ImportError:
-        return True, "PyTorch not available, skipping memory check"
-    except Exception as e:
-        return True, f"Warning: Could not check memory: {e}"
 
 
 def run_training(
@@ -196,27 +186,13 @@ def run_training(
             torch.cuda.empty_cache()
             print(f"************* Clear GPU cache before starting training to avoid memory fragmentation *************", flush=True)
             
-            # Proactive memory check
-            batch_size = extract_value_from_cmd(train_cmd, "per_device_train_batch_size")
-            batch_size_int = int(batch_size) if batch_size else None
-            is_safe, mem_msg = check_memory_before_training(batch_size_int)
-            print(f"************* {mem_msg} *************", flush=True)
-            if not is_safe:
-                print(f"************* WARNING: High memory usage detected. Training may fail with OOM. *************", flush=True)
-        else:
-            print(f"************* CUDA not available, skipping GPU cache clearing *************", flush=True)
-    except ImportError:
-        print(f"************* PyTorch not available, skipping GPU cache clearing *************", flush=True)
-    except Exception as e:
-        print(f"************* Warning: Failed to clear GPU cache: {e} *************", flush=True)
-        # Continue anyway - this is not critical
+    except:
+        print(f"************* GPU is not allowed *************", flush=True)    
+        pass
     
     for i in range(retries):
         print(f"************* Training attempt {i+1}/{retries} for task {task_id}*************", flush=True)
         if i > 0:  # there was something wrong so we will reduce the batch_size
-            # Note: This OOM reduction handles catastrophic failures before training starts.
-            # ProgressiveBatchSizeCallback (enabled via use_progressive_batch_size) handles
-            # gradual batch size increases during successful training runs.
             # first check if the training is OOM
             if os.path.exists(log_path):
                 error_type = get_error_type(log_path)
@@ -224,38 +200,31 @@ def run_training(
                     current_batch_size = extract_value_from_cmd(
                         train_cmd, "per_device_train_batch_size"
                     )
-                    if current_batch_size:
-                        current_batch_size = int(current_batch_size)
-                        if current_batch_size > 1:
-                            new_batch_size = current_batch_size // 2
-                            print(
-                                f"OOM detected: Reducing batch size from {current_batch_size} to {new_batch_size} (ProgressiveBatchSizeCallback will handle increases during training)",
-                                flush=True,
+                    current_batch_size = int(current_batch_size)
+                    if current_batch_size > 1:
+                        new_batch_size = current_batch_size // 2
+                        print(
+                            f"Reducing batch size from {current_batch_size} to {new_batch_size}",
+                            flush=True,
+                        )
+                        train_cmd = replace_args_in_cmd(
+                            train_cmd,
+                            "per_device_train_batch_size",
+                            str(new_batch_size),
+                        )
+                        # print(f"New train command: {train_cmd}", flush=True)
+                    else:
+                        print(f"batch size is 1, cannot reduce further", flush=True)
+                        if task_type == TaskType.GRPOTASK.value:
+                            # disable vllm
+                            train_cmd = replace_args_in_cmd(
+                                train_cmd, "use_vllm", "False"
                             )
-                            new_cmd = replace_args_in_cmd(
-                                train_cmd,
-                                "per_device_train_batch_size",
-                                str(new_batch_size),
-                            )
-                            if new_cmd is not None:
-                                train_cmd = new_cmd
-                            # print(f"New train command: {train_cmd}", flush=True)
-                        else:
-                            print(f"batch size is 1, cannot reduce further", flush=True)
-                            if task_type == TaskType.GRPOTASK.value:
-                                # disable vllm
-                                new_cmd = replace_args_in_cmd(
-                                    train_cmd, "use_vllm", "False"
-                                )
-                                if new_cmd is not None:
-                                    train_cmd = new_cmd
-                                # print(f"disable VLLM {train_cmd}", flush=True)
+                            # print(f"disable VLLM {train_cmd}", flush=True)
                 elif error_type == VLLM_OOM_ERROR:
                     if task_type == TaskType.GRPOTASK.value:
                         print(f"VLLM OOM error, disable VLLM", flush=True)
-                        new_cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False")
-                        if new_cmd is not None:
-                            train_cmd = new_cmd
+                        train_cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False")
 
         # empty the log file if it exists
         if os.path.exists(log_path):
@@ -278,10 +247,8 @@ def run_training(
                 import torch
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-            except ImportError:
-                pass  # PyTorch not available, skip
-            except Exception as e:
-                print(f"Warning: Failed to clear GPU cache after successful training: {e}", flush=True)
+            except:
+                pass
             return True
         time.sleep(5)
         # Clear GPU cache after failed attempt
@@ -289,10 +256,8 @@ def run_training(
             import torch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-        except ImportError:
-            pass  # PyTorch not available, skip
-        except Exception as e:
-            print(f"Warning: Failed to clear GPU cache after failed attempt: {e}", flush=True)
+        except:
+            pass
     return False
 
 
@@ -322,128 +287,8 @@ def patch_wandb_symlinks(base_dir: str):
                     pathlib.Path(full_path).touch()
 
 
-def _select_best_checkpoint(train_runs: list[dict]) -> tuple[int, float, str]:
-    """
-    Select the best checkpoint from training runs with improved tie-breaking logic.
-    
-    Selection strategy:
-    1. Primary: Use eval_loss if available (better generalization indicator)
-    2. Tie-breaking: If losses are equal (within 0.1%), prefer:
-       - Lower train_loss (less overfitting)
-       - Earlier run index (more training time remaining)
-    
-    Args:
-        train_runs: List of training run dictionaries
-        
-    Returns:
-        Tuple of (index, selected_loss, loss_type) where loss_type is 'eval_loss' or 'train_loss'
-    """
-    if not train_runs:
-        raise ValueError("Cannot select best checkpoint from empty list")
-    
-    if all("current_eval_loss" in run for run in train_runs):
-        # Use eval_loss for selection (much better than train_loss)
-        losses_for_selection = [run.get("current_eval_loss", run["current_loss"]) for run in train_runs]
-        min_loss = min(losses_for_selection)
-        
-        # Find all runs with minimum loss (within 0.1% tolerance for floating point)
-        epsilon = min_loss * 0.001
-        candidates = [
-            (i, run) for i, (loss, run) in enumerate(zip(losses_for_selection, train_runs))
-            if abs(loss - min_loss) <= epsilon
-        ]
-        
-        if len(candidates) == 1:
-            index = candidates[0][0]
-        else:
-            # Tie-breaking: prefer run with lower train_loss, then earlier index
-            candidates.sort(key=lambda x: (x[1]["current_loss"], x[0]))
-            index = candidates[0][0]
-            print(f"Tie-breaking: {len(candidates)} runs with similar eval_loss, selected index {index} (train_loss={candidates[0][1]['current_loss']:.6f})", flush=True)
-        
-        selected_loss = train_runs[index]["current_eval_loss"]
-        return index, selected_loss, "eval_loss"
-    else:
-        # Fallback to current_loss if eval_loss not available (backward compatibility)
-        losses_for_selection = [run["current_loss"] for run in train_runs]
-        min_loss = min(losses_for_selection)
-        
-        # Find all runs with minimum loss (within 0.1% tolerance)
-        epsilon = min_loss * 0.001
-        candidates = [
-            i for i, loss in enumerate(losses_for_selection)
-            if abs(loss - min_loss) <= epsilon
-        ]
-        
-        # If tie, prefer earlier run (more training time remaining)
-        index = min(candidates) if candidates else np.argmin(losses_for_selection)
-        
-        selected_loss = train_runs[index]["current_loss"]
-        return index, selected_loss, "train_loss"
-
-
-def validate_checkpoint(checkpoint_dir: str) -> bool:
-    """
-    Validate that a checkpoint is loadable and not corrupted.
-    
-    Args:
-        checkpoint_dir: Path to checkpoint directory
-    
-    Returns:
-        True if checkpoint is valid, False otherwise
-    """
-    if not os.path.exists(checkpoint_dir):
-        return False
-    
-    # Check for essential files
-    essential_files = ["config.json", "training_args.bin"]
-    for file in essential_files:
-        if not os.path.exists(os.path.join(checkpoint_dir, file)):
-            print(f"Warning: Checkpoint {checkpoint_dir} missing {file}", flush=True)
-            return False
-    
-    # Check for model files (either pytorch_model.bin or model.safetensors)
-    has_model = (
-        os.path.exists(os.path.join(checkpoint_dir, "pytorch_model.bin")) or
-        os.path.exists(os.path.join(checkpoint_dir, "model.safetensors"))
-    )
-    
-    # Check for sharded model files
-    if not has_model:
-        try:
-            has_model = any(f.startswith("pytorch_model-") for f in os.listdir(checkpoint_dir))
-        except (OSError, PermissionError) as e:
-            print(f"Warning: Cannot list files in {checkpoint_dir}: {e}", flush=True)
-            # If we can't list, assume invalid
-            return False
-    
-    if not has_model:
-        print(f"Warning: Checkpoint {checkpoint_dir} missing model files", flush=True)
-        return False
-    
-    # Try to load config to verify it's not corrupted
-    try:
-        import json
-        config_path = os.path.join(checkpoint_dir, "config.json")
-        with open(config_path, 'r') as f:
-            json.load(f)
-    except Exception as e:
-        print(f"Warning: Checkpoint {checkpoint_dir} has corrupted config: {e}", flush=True)
-        return False
-    
-    return True
-
-
 def delete_poor_checkpoints(train_runs: list[dict]):
-    """
-    Delete checkpoints that are not the best.
-    Uses eval_loss for comparison if available, otherwise uses current_loss.
-    Validates checkpoints before deletion to ensure we don't delete active ones.
-    """
-    if not train_runs:
-        return
-    
-    # Get losses for comparison
+    # Use eval_loss for deletion if available, otherwise use current_loss
     if all("current_eval_loss" in run for run in train_runs):
         # Use eval_loss for better checkpoint management
         losses_for_comparison = [run.get("current_eval_loss", run["current_loss"]) for run in train_runs]
@@ -451,33 +296,17 @@ def delete_poor_checkpoints(train_runs: list[dict]):
         for run in train_runs:
             run_loss = run.get("current_eval_loss", run["current_loss"])
             if run_loss > lowest_loss:
-                checkpoint_dir = run.get("output_dir")
-                if checkpoint_dir and os.path.exists(checkpoint_dir):
-                    # Validate checkpoint before deletion
-                    if validate_checkpoint(checkpoint_dir):
-                        print(f"Deleting checkpoint {checkpoint_dir} with eval_loss {run_loss:.6f} (train_loss: {run['current_loss']:.6f})", flush=True)
-                        try:
-                            shutil.rmtree(checkpoint_dir)
-                        except Exception as e:
-                            print(f"Warning: Failed to delete checkpoint {checkpoint_dir}: {e}", flush=True)
-                    else:
-                        print(f"Warning: Skipping deletion of invalid checkpoint {checkpoint_dir}", flush=True)
+                if os.path.exists(run["output_dir"]):
+                    print(f"Deleting checkpoint {run['output_dir']} with eval_loss {run_loss:.6f} (train_loss: {run['current_loss']:.6f})", flush=True)
+                    shutil.rmtree(run["output_dir"])
     else:
         # Fallback to current_loss
         lowest_loss = min([run["current_loss"] for run in train_runs])
         for run in train_runs:
             if run["current_loss"] > lowest_loss:
-                checkpoint_dir = run.get("output_dir")
-                if checkpoint_dir and os.path.exists(checkpoint_dir):
-                    # Validate checkpoint before deletion
-                    if validate_checkpoint(checkpoint_dir):
-                        print(f"Deleting checkpoint {checkpoint_dir} with loss {run['current_loss']}", flush=True)
-                        try:
-                            shutil.rmtree(checkpoint_dir)
-                        except Exception as e:
-                            print(f"Warning: Failed to delete checkpoint {checkpoint_dir}: {e}", flush=True)
-                    else:
-                        print(f"Warning: Skipping deletion of invalid checkpoint {checkpoint_dir}", flush=True)
+                if os.path.exists(run["output_dir"]):
+                    print(f"Deleting checkpoint {run['output_dir']} with loss {run['current_loss']}", flush=True)
+                    shutil.rmtree(run["output_dir"])
 
 
 def get_log_scale(task_type: str):
@@ -490,105 +319,230 @@ def get_log_scale(task_type: str):
     return log_scale_map[task_type]
 
 
+def _calculate_experimental_reg_ratio() -> float:
+    """Calculate reg_ratio using experimental method (empirically determined default)."""
+    return 1.24383
+
+
+def _calculate_sqrt_batch_reg_ratio(batch_size: int, reference_batch: int = 64) -> float:
+    """Calculate reg_ratio using square root batch scaling."""
+    if batch_size is None or batch_size <= 0:
+        return None
+    return np.sqrt(batch_size / reference_batch)
+
+
+def _calculate_linear_batch_reg_ratio(batch_size: int, reference_batch: int = 64) -> float:
+    """Calculate reg_ratio using linear batch scaling."""
+    if batch_size is None or batch_size <= 0:
+        return None
+    return batch_size / reference_batch
+
+
+def _calculate_adaptive_reg_ratio(
+    task_type: str = None,
+    batch_size: int = None,
+    model_params: int = None,
+    base_lr: float = None,
+    hours_to_complete: float = None
+) -> float:
+    """Calculate reg_ratio using adaptive method (combination of factors)."""
+    reg_ratio = 1.0
+    
+    # Time-aware adjustment: Additional fine-tuning for time constraints
+    # Note: Base LR already includes time constraints, so this is a smaller additional adjustment
+    # for reg_ratio to account for batch size interactions with time constraints
+    if hours_to_complete is not None and hours_to_complete > 0:
+        # Smaller adjustment here since base LR already has time factor
+        # This accounts for how batch size scaling interacts with time constraints
+        if hours_to_complete <= 0.5:  # Very short jobs (<30 min)
+            time_factor = 1.1  # Small additional boost for very short jobs
+        elif hours_to_complete <= 0.75:  # Short jobs (<45 min)
+            time_factor = 1.05
+        elif hours_to_complete <= 1.0:  # Medium-short jobs (<1 hour)
+            time_factor = 1.03
+        elif hours_to_complete <= 2.0:  # Medium jobs
+            time_factor = 1.01
+        else:  # Long jobs
+            time_factor = 1.0
+        if time_factor != 1.0:
+            reg_ratio *= time_factor
+            print(f"  [reg_ratio]   - time_aware fine-tuning: {hours_to_complete:.2f}h -> factor {time_factor:.2f} (base LR already has time adjustment)", flush=True)
+    
+    # Batch size fine-tuning adjustment
+    # Note: Base LR already includes batch_size, so this is a smaller additional adjustment
+    # for reg_ratio to account for gradient accumulation and other batch-related factors
+    if batch_size is not None and batch_size > 0:
+        reference_batch = 64
+        # Smaller adjustment here since base LR already has batch_size factor
+        # This accounts for gradient accumulation steps and other batch-related interactions
+        if batch_size < reference_batch:
+            # Small boost for smaller batches (they need slightly higher LR per sample)
+            batch_factor = 1.0 + 0.1 * (1 - batch_size / reference_batch)
+        elif batch_size > reference_batch * 2:
+            # Small reduction for very large batches (they're more stable)
+            batch_factor = 1.0 - 0.05 * min(1.0, (batch_size / (reference_batch * 2) - 1))
+        else:
+            batch_factor = 1.0
+        
+        # Cap the batch factor
+        batch_factor = max(0.95, min(1.1, batch_factor))
+        if batch_factor != 1.0:
+            reg_ratio *= batch_factor
+            print(f"  [reg_ratio]   - batch_size fine-tuning ({batch_size}): {batch_factor:.3f}x (base LR already has batch adjustment)", flush=True)
+    
+    # Model size adjustment (larger models may need different scaling)
+    if model_params is not None:
+        if model_params > 10_000_000_000:  # > 10B params
+            reg_ratio *= 0.95
+        elif model_params < 1_000_000_000:  # < 1B params
+            reg_ratio *= 1.05
+    
+    # Task type adjustment
+    if task_type:
+        task_adjustments = {
+            TaskType.GRPOTASK.value: 1.0,  # No adjustment
+            TaskType.DPOTASK.value: 1.02,
+            TaskType.INSTRUCTTEXTTASK.value: 1.02,
+            TaskType.CHATTASK.value: 1.02,
+        }
+        task_factor = task_adjustments.get(task_type, 1.0)
+        reg_ratio *= task_factor
+    
+    # Ensure reasonable bounds
+    reg_ratio = max(0.5, min(2.0, reg_ratio))
+    return reg_ratio
+
+
 def calculate_reg_ratio(
     task_type: str = None,
     batch_size: int = None,
     model_params: int = None,
     base_lr: float = None,
-    method: str = "experimental"
+    hours_to_complete: float = None,
+    method: str = "optimized"
 ) -> float:
     """
-    Calculate reg_ratio (learning rate adjustment factor) based on training parameters.
+    Calculate reg_ratio (learning rate adjustment factor) using all available methods
+    and return an optimized value.
     
     Args:
         task_type: Type of task (InstructTextTask, DpoTask, GrpoTask, ChatTask)
         batch_size: Total batch size (per_device_batch_size * num_gpus * gradient_accumulation)
         model_params: Number of model parameters
         base_lr: Base learning rate before reg_ratio adjustment
-        method: Calculation method - "experimental" (default 1.24383), "sqrt_batch" (sqrt scaling),
-                "linear_batch" (linear scaling), or "adaptive" (combination)
+        method: Calculation method - "optimized" (calculate all and choose best, default),
+                "experimental" (default 1.24383), "sqrt_batch", "linear_batch", or "adaptive"
     
     Returns:
         Calculated reg_ratio value
     """
-    if method == "experimental":
-        # Return the empirically determined default value
-        print(f"  [reg_ratio] Using experimental method: returning default value 1.24383", flush=True)
-        return 1.24383
+    print(f"  [reg_ratio] Calculating reg_ratio with method: '{method}'", flush=True)
+    print(f"  [reg_ratio] Available parameters: task_type={task_type}, batch_size={batch_size}, "
+          f"model_params={model_params}, base_lr={base_lr}, hours_to_complete={hours_to_complete}", flush=True)
     
-    elif method == "sqrt_batch":
-        # Square root scaling: reg_ratio = sqrt(batch_size / reference_batch_size)
-        # Reference batch size of 64 is common
-        if batch_size is None or batch_size <= 0:
-            print(f"  [reg_ratio] sqrt_batch method: batch_size={batch_size}, falling back to default 1.24383", flush=True)
+    # If method is not "optimized", use the legacy single-method approach
+    if method != "optimized":
+        if method == "experimental":
+            result = _calculate_experimental_reg_ratio()
+            print(f"  [reg_ratio] experimental method: {result:.6f}", flush=True)
+            return result
+        elif method == "sqrt_batch":
+            result = _calculate_sqrt_batch_reg_ratio(batch_size)
+            if result is None:
+                print(f"  [reg_ratio] sqrt_batch method: batch_size={batch_size}, falling back to default 1.24383", flush=True)
+                return 1.24383
+            print(f"  [reg_ratio] sqrt_batch method: sqrt({batch_size}/64) = {result:.6f}", flush=True)
+            return result
+        elif method == "linear_batch":
+            result = _calculate_linear_batch_reg_ratio(batch_size)
+            if result is None:
+                print(f"  [reg_ratio] linear_batch method: batch_size={batch_size}, falling back to default 1.24383", flush=True)
+                return 1.24383
+            print(f"  [reg_ratio] linear_batch method: {batch_size}/64 = {result:.6f}", flush=True)
+            return result
+        elif method == "adaptive":
+            result = _calculate_adaptive_reg_ratio(task_type, batch_size, model_params, base_lr, hours_to_complete)
+            print(f"  [reg_ratio] adaptive method: {result:.6f}", flush=True)
+            return result
+        else:
+            print(f"  [reg_ratio] Unknown method '{method}', falling back to default 1.24383", flush=True)
             return 1.24383
-        reference_batch = 64
-        calculated = np.sqrt(batch_size / reference_batch)
-        print(f"  [reg_ratio] sqrt_batch method: sqrt({batch_size}/{reference_batch}) = {calculated:.6f}", flush=True)
-        return calculated
     
-    elif method == "linear_batch":
-        # Linear scaling: reg_ratio = batch_size / reference_batch_size
-        if batch_size is None or batch_size <= 0:
-            print(f"  [reg_ratio] linear_batch method: batch_size={batch_size}, falling back to default 1.24383", flush=True)
-            return 1.24383
-        reference_batch = 64
-        calculated = batch_size / reference_batch
-        print(f"  [reg_ratio] linear_batch method: {batch_size}/{reference_batch} = {calculated:.6f}", flush=True)
-        return calculated
+    # Optimized method: calculate all available methods and choose the best value
+    print(f"\n  [reg_ratio] OPTIMIZED MODE: Calculating all available methods...", flush=True)
+    values = {}
+    weights = {}
     
-    elif method == "adaptive":
-        # Adaptive calculation based on multiple factors
-        reg_ratio = 1.0
-        print(f"  [reg_ratio] adaptive method: starting with base=1.0", flush=True)
-        
-        # Batch size adjustment (sqrt scaling)
-        if batch_size is not None and batch_size > 0:
-            reference_batch = 64
-            batch_factor = np.sqrt(batch_size / reference_batch)
-            print(f"  [reg_ratio]   - batch_size adjustment: sqrt({batch_size}/{reference_batch}) = {batch_factor:.6f}", flush=True)
-            reg_ratio *= batch_factor
-            print(f"  [reg_ratio]   - after batch adjustment: {reg_ratio:.6f}", flush=True)
-        
-        # Model size adjustment (larger models may need different scaling)
-        if model_params is not None:
-            if model_params > 10_000_000_000:  # > 10B params
-                adjustment = 0.95
-                print(f"  [reg_ratio]   - model_size adjustment: {model_params/1e9:.1f}B params -> factor {adjustment:.2f}", flush=True)
-                reg_ratio *= adjustment
-            elif model_params < 1_000_000_000:  # < 1B params
-                adjustment = 1.05
-                print(f"  [reg_ratio]   - model_size adjustment: {model_params/1e6:.1f}M params -> factor {adjustment:.2f}", flush=True)
-                reg_ratio *= adjustment
-            else:
-                print(f"  [reg_ratio]   - model_size adjustment: {model_params/1e9:.1f}B params -> no adjustment", flush=True)
-            print(f"  [reg_ratio]   - after model adjustment: {reg_ratio:.6f}", flush=True)
-        
-        # Task type adjustment
-        if task_type:
-            task_adjustments = {
-                TaskType.GRPOTASK.value: 1.0,  # No adjustment
-                TaskType.DPOTASK.value: 1.02,
-                TaskType.INSTRUCTTEXTTASK.value: 1.02,
-                TaskType.CHATTASK.value: 1.02,
-            }
-            task_factor = task_adjustments.get(task_type, 1.0)
-            print(f"  [reg_ratio]   - task_type adjustment: {task_type} -> factor {task_factor:.2f}", flush=True)
-            reg_ratio *= task_factor
-            print(f"  [reg_ratio]   - after task adjustment: {reg_ratio:.6f}", flush=True)
-        
-        # Ensure reasonable bounds
-        original = reg_ratio
-        reg_ratio = max(0.5, min(2.0, reg_ratio))
-        if original != reg_ratio:
-            print(f"  [reg_ratio]   - clamping: {original:.6f} -> {reg_ratio:.6f} (bounds: 0.5-2.0)", flush=True)
-        
-        print(f"  [reg_ratio] adaptive method: final result = {reg_ratio:.6f}", flush=True)
-        return reg_ratio
+    # 1. Experimental method (always available, high weight as baseline)
+    exp_value = _calculate_experimental_reg_ratio()
+    values["experimental"] = exp_value
+    weights["experimental"] = 0.3  # High weight as empirically determined baseline
+    print(f"    - experimental: {exp_value:.6f} (weight: {weights['experimental']:.2f})", flush=True)
     
+    # 2. Sqrt batch method (requires batch_size)
+    sqrt_value = _calculate_sqrt_batch_reg_ratio(batch_size)
+    if sqrt_value is not None:
+        values["sqrt_batch"] = sqrt_value
+        weights["sqrt_batch"] = 0.25
+        print(f"    - sqrt_batch: {sqrt_value:.6f} (weight: {weights['sqrt_batch']:.2f})", flush=True)
     else:
-        # Unknown method, return default
-        return 1.24383
+        print(f"    - sqrt_batch: skipped (batch_size not available)", flush=True)
+    
+    # 3. Linear batch method (requires batch_size)
+    linear_value = _calculate_linear_batch_reg_ratio(batch_size)
+    if linear_value is not None:
+        values["linear_batch"] = linear_value
+        weights["linear_batch"] = 0.15  # Lower weight as linear scaling can be too aggressive
+        print(f"    - linear_batch: {linear_value:.6f} (weight: {weights['linear_batch']:.2f})", flush=True)
+    else:
+        print(f"    - linear_batch: skipped (batch_size not available)", flush=True)
+    
+    # 4. Adaptive method (uses all available parameters)
+    adaptive_value = _calculate_adaptive_reg_ratio(task_type, batch_size, model_params, base_lr, hours_to_complete)
+    values["adaptive"] = adaptive_value
+    weights["adaptive"] = 0.3  # High weight as it considers multiple factors
+    print(f"    - adaptive: {adaptive_value:.6f} (weight: {weights['adaptive']:.2f})", flush=True)
+    
+    # Calculate weighted average
+    total_weight = sum(weights.values())
+    if total_weight == 0 or len(values) == 0:
+        # Safety fallback: should never happen since experimental is always added
+        print(f"    - Warning: No values calculated, using experimental default", flush=True)
+        return exp_value
+    
+    weighted_sum = sum(values[method] * weights[method] for method in values.keys())
+    weighted_avg = weighted_sum / total_weight
+    
+    # Also calculate median for robustness
+    sorted_values = sorted(values.values())
+    n = len(sorted_values)
+    if n == 0:
+        # Safety fallback
+        return exp_value
+    elif n % 2 == 0:
+        median_value = (sorted_values[n//2 - 1] + sorted_values[n//2]) / 2
+    else:
+        median_value = sorted_values[n//2]
+    
+    # Choose optimized value: use weighted average, but ensure it's within reasonable bounds
+    # and close to the median (robustness check)
+    optimized_value = weighted_avg
+    
+    # If weighted average deviates significantly from median, use median instead
+    if abs(optimized_value - median_value) > 0.2:
+        print(f"    - Warning: weighted_avg ({optimized_value:.6f}) deviates from median ({median_value:.6f})", flush=True)
+        optimized_value = median_value
+    
+    # Ensure reasonable bounds
+    optimized_value = max(0.5, min(2.0, optimized_value))
+    
+    print(f"\n  [reg_ratio] OPTIMIZATION RESULTS:", flush=True)
+    print(f"    - All calculated values: {[f'{v:.6f}' for v in sorted(values.values())]}", flush=True)
+    print(f"    - Weighted average: {weighted_avg:.6f}", flush=True)
+    print(f"    - Median: {median_value:.6f}", flush=True)
+    print(f"    - Final optimized value: {optimized_value:.6f}", flush=True)
+    
+    return optimized_value
 
 
 def main():
@@ -651,78 +605,47 @@ def main():
     parser.add_argument(
         "--reg-ratio-method",
         type=str,
-        choices=["experimental", "sqrt_batch", "linear_batch", "adaptive"],
-        help="Method to calculate reg_ratio",
-        default="experimental"
+        choices=["optimized", "experimental", "sqrt_batch", "linear_batch", "adaptive"],
+        help="Method to calculate reg_ratio. 'optimized' calculates all methods and chooses best value (default)",
+        default="optimized"
     )
 
     args = parser.parse_args()
+    original_model_name = args.model
+    original_task_type = args.task_type
+    
+    # Try to get model parameters early for reg_ratio calculation
+    model_params = None
+    try:
+        from model_utility import get_model_num_params
+        # Get model path early if possible
+        model_path = str(train_paths.get_text_base_model_path(original_model_name))
+        if os.path.exists(model_path) or model_path:  # Check if path exists or is a model name
+            model_params = get_model_num_params(original_model_name, model_path)
+            if model_params:
+                print(f"Early model params detection: {model_params/1e9:.2f}B parameters", flush=True)
+    except Exception as e:
+        print(f"Could not get model params early (will use defaults): {e}", flush=True)
     
     # Calculate reg_ratio if not explicitly provided
     print(f"\n{'='*60}", flush=True)
     print(f"REG_RATIO CALCULATION", flush=True)
     print(f"{'='*60}", flush=True)
     if args.reg_ratio is None:
-        # Calculate reg_ratio using all available methods and select optimal
-        print(f"Calculating reg_ratio using ALL methods and selecting optimal value", flush=True)
+        print(f"Calculating reg_ratio using method: '{args.reg_ratio_method}'", flush=True)
         print(f"Task type: {args.task_type}", flush=True)
-        
-        # Get model info if available for better calculations
-        model_params = None
-        batch_size = None
-        base_lr = None
-        try:
-            from model_utility import get_model_num_params
-            model_path = str(train_paths.get_text_base_model_path(args.model))
-            model_params = get_model_num_params(args.model, model_path)
-            if model_params:
-                print(f"  Model params: {model_params:,}", flush=True)
-        except Exception as e:
-            print(f"  Could not get model params (will use defaults): {e}", flush=True)
-        
-        # Calculate reg_ratio for all methods
-        all_methods = ["experimental", "sqrt_batch", "linear_batch", "adaptive"]
-        reg_ratios = {}
-        
-        print(f"\n  Calculating reg_ratio for all methods:", flush=True)
-        for method in all_methods:
-            try:
-                reg_ratio_value = calculate_reg_ratio(
-                    task_type=args.task_type,
-                    batch_size=batch_size,
-                    model_params=model_params,
-                    base_lr=base_lr,
-                    method=method
-                )
-                reg_ratios[method] = reg_ratio_value
-                print(f"    {method:15s}: {reg_ratio_value:.6f}", flush=True)
-            except Exception as e:
-                print(f"    {method:15s}: ERROR - {e}", flush=True)
-        
-        # Select optimal reg_ratio
-        if not reg_ratios:
-            # Fallback to experimental if all methods failed
-            print(f"  WARNING: All methods failed, using experimental default", flush=True)
-            args.reg_ratio = 1.24383
-        else:
-            # Strategy: Prefer adaptive if available (most sophisticated), otherwise use median
-            if "adaptive" in reg_ratios:
-                args.reg_ratio = reg_ratios["adaptive"]
-                print(f"\n  [OPTIMAL] Selected 'adaptive' method: {args.reg_ratio:.6f} (most sophisticated)", flush=True)
-            else:
-                # Use median of all calculated values (robust to outliers)
-                values = sorted(reg_ratios.values())
-                median_idx = len(values) // 2
-                args.reg_ratio = values[median_idx] if len(values) % 2 == 1 else (values[median_idx - 1] + values[median_idx]) / 2
-                print(f"\n  [OPTIMAL] Selected median value: {args.reg_ratio:.6f} (from {len(reg_ratios)} methods)", flush=True)
-                print(f"    Values considered: {[f'{v:.6f}' for v in values]}", flush=True)
-        
-        print(f"\n[OK] Final optimized reg_ratio: {args.reg_ratio:.6f}", flush=True)
+        args.reg_ratio = calculate_reg_ratio(
+            task_type=args.task_type,
+            batch_size=None,  # Will be available later, but optimized method can work without it
+            model_params=model_params,
+            base_lr=None,  # Will be available later
+            hours_to_complete=args.hours_to_complete,
+            method=args.reg_ratio_method
+        )
+        print(f"\n[OK] Final calculated reg_ratio: {args.reg_ratio:.6f}", flush=True)
     else:
         print(f"Using explicitly provided reg_ratio: {args.reg_ratio:.6f}", flush=True)
     print(f"{'='*60}\n", flush=True)
-    original_model_name = args.model
-    original_task_type = args.task_type
 
     # Short-job mode: prioritize getting to GPU training fast and avoid multi-run restarts
     # which add overhead (re-tokenization, repeated training launches, checkpoint churn).
@@ -760,7 +683,7 @@ def main():
     model_path = str(train_paths.get_text_base_model_path(original_model_name))
 
     is_openai = False
-    if is_openai_model(original_model_name):
+    if is_openai_model(original_model_name, model_path):
         print("Upgrading python packages for openai model", flush=True)
         run_cmd_with_log(
             "pip uninstall -y transformers && pip install transformers==4.55.0",
@@ -798,12 +721,6 @@ def main():
         "reg_ratio": args.reg_ratio,
         "find_lk_lr": True,
         "checking_mode": "first_time",
-        # Enable progressive batch size scaling strategy:
-        # Start with 16 or 32, confirm training is stable, increase until near memory limit,
-        # scale learning rate proportionally, stop when speed improvement is small or validation accuracy drops
-        "use_progressive_batch_size": True,
-        "max_batch_size": 128,  # Maximum batch size for progressive scaling
-        "stability_steps": 10,  # Steps to confirm training stability before increasing batch size
     }
 
     if (args.task_type == TaskType.INSTRUCTTEXTTASK.value or args.task_type == TaskType.CHATTASK.value):
@@ -840,24 +757,10 @@ def main():
     # at first the state is always running the train_cmd
 
     set_state(state)
+    # TODO Run something magic here
     count = 0
-    max_iterations = 20  # Safety limit to prevent infinite loops
-    while count < max_iterations:
+    while True:
         state = get_state()
-        
-        # Validate state structure
-        if not isinstance(state, dict):
-            print(f"ERROR: Invalid state type: {type(state)}, resetting to initial", flush=True)
-            state = {"mode": "initial"}
-            set_state(state)
-        
-        # Validate mode
-        valid_modes = ["initial", "continue", "finish"]
-        if state.get("mode") not in valid_modes:
-            print(f"ERROR: Invalid mode '{state.get('mode')}', resetting to initial", flush=True)
-            state["mode"] = "initial"
-            set_state(state)
-        
         train_cmd = original_train_cmd  # will replace based on the state later
         c_train_info = copy.deepcopy(train_info)
         final_output_dir = None
@@ -872,28 +775,8 @@ def main():
                 c_train_info["train_request"]["checking_mode"] = "second_time"
                 n_runs = state["next_runs"]
                 if "lrs" not in state: # first time of continue
-                    if "train" not in state or "lr" not in state.get("train", {}):
-                        print(f"Error: Missing 'train' or 'lr' in state, cannot continue. State keys: {list(state.keys())}", flush=True)
-                        state["mode"] = "finish"
-                        set_state(state)
-                        break
                     current_lr = float(state["train"]["lr"])
-                    
-                    # Smart LR exploration: use previous run results to guide exploration
-                    if "runs" in state and len(state.get("runs", [])) > 0:
-                        # Use smart exploration with previous results
-                        print(f"Using smart LR exploration with {len(state['runs'])} previous runs", flush=True)
-                        state["lrs"] = lr_utils.smart_explore_learning_rates(
-                            current_lr, 
-                            state["runs"], 
-                            n_runs, 
-                            log_range=get_log_scale(args.task_type)
-                        )
-                    else:
-                        # First time: standard exploration
-                        print(f"Using standard LR exploration (no previous runs)", flush=True)
-                        state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
-                    
+                    state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
                     assert len(state["lrs"]) == n_runs, f"Number of learning rates {state['lrs']} should be equal to number of runs {n_runs}"
                     state["runs"] = []
                 
@@ -903,13 +786,22 @@ def main():
                 if len(state["runs"]) < n_runs:
                     index = len(state["runs"])
                     current_lr = state["lrs"][index]
-                    new_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
-                    if new_cmd is not None:
-                        train_cmd = new_cmd
+                    train_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
                 else: # the final run - continue training the best checkpoint to completion
-                    # Select best checkpoint based on eval_loss if available, otherwise train_loss
-                    index, selected_loss, loss_type = _select_best_checkpoint(state["runs"])
-                    print(f"BL (using {loss_type});{index};{loss_type}={selected_loss:.6f};train_loss={state['runs'][index]['current_loss']:.6f};lr={state['lrs'][index]}", flush=True)
+                    # CRITICAL: Use eval_loss for selection if available, otherwise fall back to current_loss
+                    # This is the key improvement - eval_loss is what matters for generalization
+                    if all("current_eval_loss" in run for run in state["runs"]):
+                        # Use eval_loss for selection (much better than train_loss)
+                        losses_for_selection = [run.get("current_eval_loss", run["current_loss"]) for run in state["runs"]]
+                        index = np.argmin(losses_for_selection)
+                        selected_loss = state["runs"][index]["current_eval_loss"]
+                        print(f"BL (using eval_loss);{index};eval_loss={selected_loss:.6f};train_loss={state['runs'][index]['current_loss']:.6f};lr={state['lrs'][index]}", flush=True)
+                    else:
+                        # Fallback to current_loss if eval_loss not available (backward compatibility)
+                        losses_for_selection = [run["current_loss"] for run in state["runs"]]
+                        index = np.argmin(losses_for_selection)
+                        selected_loss = state["runs"][index]["current_loss"]
+                        print(f"BL (using train_loss fallback);{index};{selected_loss:.6f}; {state['lrs'][index]}", flush=True)
                     
                     c_train_info["train_request"]["checking_mode"] = "none"
                     # Use the best checkpoint's train_cmd and output_dir
@@ -918,9 +810,7 @@ def main():
                     final_output_dir = state["runs"][index]["output_dir"]
                     state["mode"] = "finish"
             else: # the state = finish; no need to run more
-                if state["mode"] != "finish":
-                    print(f"WARNING: Expected mode 'finish' but got '{state['mode']}', setting to finish", flush=True)
-                    state["mode"] = "finish"
+                assert state["mode"] == "finish"
                 break
         
         set_state(state)
@@ -930,17 +820,13 @@ def main():
                 run_output_dir = final_output_dir
             else:
                 run_output_dir = output_dir + f"_{count}"
-            new_cmd = replace_args_in_cmd(train_cmd, "output_dir", run_output_dir)
-            if new_cmd is not None:
-                train_cmd = new_cmd
+            train_cmd = replace_args_in_cmd(train_cmd, "output_dir", run_output_dir)
             
             current_request_path = os.path.join(ds_folder, f"training_request_{args.task_id}_{count}.json")
             with open(current_request_path, "w") as f:
                 json.dump(c_train_info, f, indent=4, ensure_ascii=False)
             
-            new_cmd = replace_args_in_cmd(train_cmd, "request_path", current_request_path)
-            if new_cmd is not None:
-                train_cmd = new_cmd
+            train_cmd = replace_args_in_cmd(train_cmd, "request_path", current_request_path)
             
             state["train"] = {
                 "train_cmd": train_cmd,

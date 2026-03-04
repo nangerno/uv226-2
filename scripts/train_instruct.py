@@ -10,7 +10,7 @@ import torch
 from transformers.trainer_utils import is_main_process
 from dataclasses import dataclass, field
 from transformers import Trainer
-from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb, EarlyStoppingCallback, ProgressiveBatchSizeCallback
+from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb, EarlyStoppingCallback
 
 # from packing.packed_dataset import PackedDataset
 from transformers import (
@@ -228,44 +228,21 @@ def main():
     if "max_length" in train_request:
         max_length = train_request["max_length"]
 
-    # New Strategy: Progressive Batch Size Scaling
-    # Start with 16 or 32, confirm training is stable, increase until near memory limit,
-    # scale learning rate proportionally, stop when speed improvement is small or validation accuracy drops
-    use_progressive_batch_size = train_request.get("use_progressive_batch_size", True)
-    if use_progressive_batch_size:
-        # Set initial batch size to 16 or 32 based on model size and sequence length
-        # Check longer sequences first (more restrictive)
+    # Reduce OOM retries by applying a conservative batch-size cap for long sequence lengths.
+    # This is much faster than crashing multiple times and halving repeatedly.
+    if train_request.get("adjust_batch_size", True):
+        cap = None
         if max_length >= 2048:
-            initial_batch_size = 8 if not training_args.use_lora else 16
+            cap = 8 if not training_args.use_lora else 16
         elif max_length >= 1536:
-            initial_batch_size = 12 if not training_args.use_lora else 24
+            cap = 12 if not training_args.use_lora else 24
         elif max_length >= 1024:
-            initial_batch_size = 16 if not training_args.use_lora else 32
-        elif max_length < 1024 and not training_args.use_lora:
-            initial_batch_size = 32
-        else:
-            initial_batch_size = 16
-        
-        if training_args.per_device_train_batch_size > initial_batch_size:
+            cap = 24 if not training_args.use_lora else 48
+        if cap is not None and training_args.per_device_train_batch_size > cap:
             log_info(
-                f"ProgressiveBatchSize: Setting initial batch size to {initial_batch_size} (was {training_args.per_device_train_batch_size})"
+                f"Capping per_device_train_batch_size from {training_args.per_device_train_batch_size} to {cap} (max_length={max_length}) to avoid OOM"
             )
-            training_args.per_device_train_batch_size = initial_batch_size
-    else:
-        # Fallback to old conservative capping logic
-        if train_request.get("adjust_batch_size", True):
-            cap = None
-            if max_length >= 2048:
-                cap = 8 if not training_args.use_lora else 16
-            elif max_length >= 1536:
-                cap = 12 if not training_args.use_lora else 24
-            elif max_length >= 1024:
-                cap = 24 if not training_args.use_lora else 48
-            if cap is not None and training_args.per_device_train_batch_size > cap:
-                log_info(
-                    f"Capping per_device_train_batch_size from {training_args.per_device_train_batch_size} to {cap} (max_length={max_length}) to avoid OOM"
-                )
-                training_args.per_device_train_batch_size = cap
+            training_args.per_device_train_batch_size = cap
 
     # we already tokenize the data and save it to train_tokenized.json and dev_tokenized.json
     train_ds = MyDataset(
@@ -374,8 +351,8 @@ def main():
     
     try:
         model.config.use_cache = False
-    except Exception as e:
-        log_info(f"Warning: Failed to set use_cache=False: {e}")
+    except:
+        pass
     
     # some model need to set the generation config or encounter the invalid generation config error
     set_generation_config(train_request["model_name"], model)
@@ -416,46 +393,26 @@ def main():
     if checking_step >= total_steps_per_epoch:
         checking_step = total_steps_per_epoch - 2
     
-    # Build callbacks list
-    callbacks = [
-        CustomEvalSaveCallback(
-            WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
-            train_request["submission_dir"],
-            training_args.output_dir,
-            train_request["model_name"],
-            max_steps, 
-            checking_step=checking_step,
-            total_steps_all_epochs=total_steps_all_epochs,
-            end_time=train_request["end_time"],
-            checking_mode=train_request.get("checking_mode", "none")
-        ),
-        EarlyStoppingCallback(patience=300, min_delta=0.0001, end_time=train_request.get("end_time", ""), max_steps=max_steps)
-    ]
-    
-    # Add progressive batch size callback if enabled
-    if use_progressive_batch_size:
-        max_batch_size = train_request.get("max_batch_size", 128)
-        stability_steps = train_request.get("stability_steps", 50)
-        callbacks.append(
-            ProgressiveBatchSizeCallback(
-                initial_batch_size=training_args.per_device_train_batch_size,
-                max_batch_size=max_batch_size,
-                stability_steps=stability_steps,
-                min_speed_improvement=0.05,
-                eval_accuracy_drop_threshold=0.01,
-                batch_size_multiplier=1.5,
-                memory_safety_margin=0.9
-            )
-        )
-        log_info(f"ProgressiveBatchSize: Enabled with initial_batch_size={training_args.per_device_train_batch_size}, max_batch_size={max_batch_size}")
-    
     trainer = Trainer(
         model=model,
         processing_class=tokenizer,  # Changed from tokenizer to processing_class (deprecated parameter)
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=dev_ds,
-        callbacks=callbacks,
+        callbacks=[
+            CustomEvalSaveCallback(
+                WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
+                train_request["submission_dir"],
+                training_args.output_dir,
+                train_request["model_name"],
+                max_steps, 
+                checking_step=checking_step,
+                total_steps_all_epochs=total_steps_all_epochs,
+                end_time=train_request["end_time"],
+                checking_mode=train_request.get("checking_mode", "none")
+            ),
+            EarlyStoppingCallback(patience=300, min_delta=0.0001, hours_to_complete=train_request.get("hours_to_complete"))
+        ],
     )
 
     trainer.tokenizer = tokenizer

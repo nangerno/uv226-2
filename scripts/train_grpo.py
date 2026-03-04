@@ -33,7 +33,7 @@ from peft import (
 import traceback
 import argparse
 import math
-from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, GRPOCustomEvalSaveCallback, WhenToEvalHandler, init_wandb, EarlyStoppingCallback, ProgressiveBatchSizeCallback
+from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, GRPOCustomEvalSaveCallback, WhenToEvalHandler, init_wandb, EarlyStoppingCallback
 from transformers.modeling_utils import is_deepspeed_zero3_enabled
 import os
 import glob
@@ -277,31 +277,30 @@ def get_reward_funcs(dataset_type: dict, sample_data, has_extra_column: bool):
     for i, (original_func, func_name, weight) in enumerate(
         zip(reward_funcs_callable, reward_func_names, reward_weights)
     ):
-        supports_extra = supports_extra_data(original_func)
-        use_extra = supports_extra and has_extra_column
-        print(f"Reward function {func_name}: supports_extra={supports_extra}, has_extra_column={has_extra_column}, using_extra={use_extra}")
-        
-        def create_wrapper(original_func, func_name, weight, use_extra):
-            """Create a wrapper function that applies weight and captures rewards."""
-            def apply_weight_and_capture(raw_results, func_name, weight):
-                """Helper to apply weight and capture rewards."""
-                raw_rewards[func_name].extend(raw_results)
-                weighted_results = [r * weight for r in raw_results]
-                captured_rewards[func_name].extend(weighted_results)
-                return weighted_results
-            
-            if use_extra:
+
+        def create_wrapper(original_func, func_name, weight):
+            supports_extra = supports_extra_data(original_func)
+            print(f"supports_extra: {supports_extra}, has_extra_column: {has_extra_column}")
+            if supports_extra and has_extra_column:
+                print(f"Using extra data for {func_name}")
                 def wrapper(completions, extra_data, **kwargs):
                     raw_results = original_func(completions, extra_data=extra_data)
-                    return apply_weight_and_capture(raw_results, func_name, weight)
+                    raw_rewards[func_name].extend(raw_results)
+                    weighted_results = [r * weight for r in raw_results]
+                    captured_rewards[func_name].extend(weighted_results)
+                    return weighted_results
             else:
+                print(f"Not using extra data for {func_name}")
                 def wrapper(completions, **kwargs):
                     raw_results = original_func(completions)
-                    return apply_weight_and_capture(raw_results, func_name, weight)
-            
+                    raw_rewards[func_name].extend(raw_results)
+                    weighted_results = [r * weight for r in raw_results]
+                    captured_rewards[func_name].extend(weighted_results)
+                    return weighted_results
+
             return wrapper
 
-        wrapped_reward_funcs.append(create_wrapper(original_func, func_name, weight, use_extra))
+        wrapped_reward_funcs.append(create_wrapper(original_func, func_name, weight))
 
     return wrapped_reward_funcs
 
@@ -460,48 +459,6 @@ def main():
     sample_data = dev_ds.to_list()[:10] if len(dev_ds) > 10 else None
     wrapped_reward_funcs = get_reward_funcs(train_request["dataset_type"], sample_data, has_extra_column)
     
-    # Build callbacks list
-    callbacks = [
-        CustomEvalSaveCallback(
-            WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
-            train_request["submission_dir"],
-            training_args.output_dir,
-            train_request["model_name"],
-            max_steps,
-            checking_step=checking_step,
-            total_steps_all_epochs=total_steps_all_epochs,
-            end_time=train_request["end_time"],
-            checking_mode=train_request.get("checking_mode", "none")
-        ),
-        EarlyStoppingCallback(patience=300, min_delta=0.0001, end_time=train_request.get("end_time", ""), max_steps=max_steps)
-    ]
-    
-    # Add progressive batch size callback if enabled
-    use_progressive_batch_size = train_request.get("use_progressive_batch_size", True)
-    if use_progressive_batch_size:
-        # Set initial batch size to 16 or 32
-        initial_batch_size = 16
-        if training_args.per_device_train_batch_size > initial_batch_size:
-            log_info(
-                f"ProgressiveBatchSize: Setting initial batch size to {initial_batch_size} (was {training_args.per_device_train_batch_size})"
-            )
-            training_args.per_device_train_batch_size = initial_batch_size
-        
-        max_batch_size = train_request.get("max_batch_size", 128)
-        stability_steps = train_request.get("stability_steps", 50)
-        callbacks.append(
-            ProgressiveBatchSizeCallback(
-                initial_batch_size=training_args.per_device_train_batch_size,
-                max_batch_size=max_batch_size,
-                stability_steps=stability_steps,
-                min_speed_improvement=0.05,
-                eval_accuracy_drop_threshold=0.01,
-                batch_size_multiplier=1.5,
-                memory_safety_margin=0.9
-            )
-        )
-        log_info(f"ProgressiveBatchSize: Enabled with initial_batch_size={training_args.per_device_train_batch_size}, max_batch_size={max_batch_size}")
-    
     trainer = GRPOTrainer(
         model=model,
         reward_funcs=wrapped_reward_funcs,
@@ -510,7 +467,20 @@ def main():
         eval_dataset=dev_ds,
         processing_class=tokenizer,
         peft_config=peft_config,
-        callbacks=callbacks,
+        callbacks=[
+            CustomEvalSaveCallback(
+                WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
+                train_request["submission_dir"],
+                training_args.output_dir,
+                train_request["model_name"],
+                max_steps,
+                checking_step=checking_step,
+                total_steps_all_epochs=total_steps_all_epochs,
+                end_time=train_request["end_time"],
+                checking_mode=train_request.get("checking_mode", "none")
+            ),
+            EarlyStoppingCallback(patience=300, min_delta=0.0001, hours_to_complete=train_request.get("hours_to_complete"))
+        ],
     )
 
     # Automatically resume from last checkpoint if one exists

@@ -52,28 +52,6 @@ def remove_empty_items(items: list):
     return result
 
 
-def filter_identical_pairs(items: list, chosen_field: str = "chosen", rejected_field: str = "rejected") -> list:
-    """Filter out items where chosen == rejected (causes training issues)"""
-    filtered = []
-    removed_count = 0
-    
-    for item in items:
-        chosen = item.get(chosen_field, "")
-        rejected = item.get(rejected_field, "")
-        
-        # Skip if chosen and rejected are identical
-        if chosen == rejected:
-            removed_count += 1
-            continue
-        
-        filtered.append(item)
-    
-    if removed_count > 0:
-        print(f"Filtered out {removed_count} items with identical chosen/rejected pairs")
-    
-    return filtered
-
-
 def split_dataset(total_data_path: str, train_data_path: str, dev_data_path: str, seed: int = 42, dev_size: int = 200, max_data_size: int = -1, model: str = ""):
     """Split the dataset into train and dev"""
     # Load the dataset
@@ -84,26 +62,6 @@ def split_dataset(total_data_path: str, train_data_path: str, dev_data_path: str
     random.shuffle(data)
     stringify_wrong_item(data)
     data = remove_empty_items(data)
-    
-    # Filter identical chosen/rejected pairs (critical for DPO training)
-    # Try to detect field names from common patterns
-    chosen_field = None
-    rejected_field = None
-    for field in ["chosen", "chosen_response", "response_chosen", "preferred"]:
-        if any(field in item for item in data[:10] if isinstance(item, dict)):
-            chosen_field = field
-            break
-    for field in ["rejected", "rejected_response", "response_rejected", "dispreferred"]:
-        if any(field in item for item in data[:10] if isinstance(item, dict)):
-            rejected_field = field
-            break
-    
-    if chosen_field and rejected_field:
-        original_count = len(data)
-        data = filter_identical_pairs(data, chosen_field, rejected_field)
-        if len(data) < original_count:
-            print(f"Removed {original_count - len(data)} items with identical chosen/rejected pairs")
-    
     if model in REMOVE_ADD_TOKEN:
         print(f"Removing {REMOVE_ADD_TOKEN[model]} token from {model}")
         data = remove_sep_token(data, REMOVE_ADD_TOKEN[model])
@@ -111,21 +69,9 @@ def split_dataset(total_data_path: str, train_data_path: str, dev_data_path: str
     if max_data_size > 0:
         data = data[:max_data_size]
     
-    # Validate minimum dataset size
-    min_size = 10
-    if len(data) < min_size:
-        raise ValueError(f"Dataset too small after filtering: {len(data)} < {min_size}. Need at least {min_size} valid samples.")
-    
     # Split the dataset into train and dev
     dev_items = data[:dev_size]
     train_items = data[dev_size:]
-    
-    # Validate split sizes
-    if len(train_items) < min_size:
-        print(f"Warning: Train set very small ({len(train_items)} items), consider reducing dev_size")
-    if len(dev_items) < 5:
-        print(f"Warning: Dev set very small ({len(dev_items)} items), may affect evaluation quality")
-    
     # Save the train and dev datasets
     with open(train_data_path, 'w') as file:
         json.dump(train_items, file, ensure_ascii=False)
@@ -150,15 +96,26 @@ def _adapt_dpo_columns_to_trl(dataset: Dataset, dataset_type: dict) -> Dataset:
     rejected_field = dataset_type["field_rejected"]
     
     if chosen_field in dataset.column_names and rejected_field in dataset.column_names:
-        # Filter out identical pairs before column mapping
-        original_size = len(dataset)
-        dataset = dataset.filter(lambda x: x[chosen_field] != x[rejected_field])
-        removed_count = original_size - len(dataset)
+        identical_count = 0
+        sample_size = min(10, len(dataset))
+        sample_indices = list(range(sample_size))
         
-        if removed_count > 0:
-            print(f"CRITICAL: Removed {removed_count}/{original_size} samples with identical chosen/rejected pairs")
-            if len(dataset) < 10:
-                raise ValueError(f"Too few valid samples after filtering identical pairs: {len(dataset)} < 10")
+        for idx in sample_indices:
+            example = dataset[idx]
+            chosen = example[chosen_field]
+            rejected = example[rejected_field]
+            
+            if chosen == rejected:
+                identical_count += 1
+        
+        if identical_count > 0:
+            print(f"CRITICAL: Found {identical_count}/{sample_size} samples with identical chosen/rejected, causing random predictions")
+
+            if identical_count > 0:
+                example = dataset[sample_indices[0]]
+                chosen = example[chosen_field]
+                rejected = example[rejected_field]
+                print(f"Example: Chosen/Rejected: '{chosen[:100]}...'")
 
     column_mapping = {
         dataset_type["field_prompt"]: TRL_DPO_FIELD_PROMPT,
@@ -200,16 +157,52 @@ def main(training_request_path: str):
     
     model_name = training_request["train_request"]["model_name"]
     
-    # Adaptive dev split for short jobs
+    # Improved adaptive dev split: considers dataset size, model size, sequence length, time, and multi-run mode
     hours_to_complete = float(training_request["train_request"].get("hours_to_complete", 0) or 0)
     dev_size = int(training_request["train_request"].get("dev_size", 0) or 0)
+    
     if dev_size <= 0:
-        if hours_to_complete > 0 and hours_to_complete <= 0.5:
-            dev_size = 50
-        elif hours_to_complete > 0 and hours_to_complete <= 1.0:
-            dev_size = 100
-        else:
-            dev_size = 200
+        # Import the adaptive calculation function from tokenize_instruct
+        import sys
+        import os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from tokenize_instruct import calculate_adaptive_dev_size
+        
+        # Get dataset size
+        dataset_size = None
+        try:
+            from model_utility import get_data_size
+            dataset_size = get_data_size(total_path)
+        except:
+            pass
+        
+        # Get model info
+        model_params = None
+        try:
+            from model_utility import get_model_num_params
+            model_path = training_request["train_request"].get("model_path", "")
+            if model_path:
+                model_params = get_model_num_params(model_name, model_path)
+        except:
+            pass
+        
+        # Get sequence length
+        max_length = training_request["train_request"].get("max_length", 1024)
+        avg_seq_length = max_length
+        
+        # Check multi-run mode
+        checking_mode = training_request["train_request"].get("checking_mode", "none")
+        multi_run_enabled = checking_mode in ["first_time", "second_time"]
+        
+        # Calculate adaptive dev size
+        dev_size = calculate_adaptive_dev_size(
+            dataset_size=dataset_size,
+            hours_to_complete=hours_to_complete,
+            model_params=model_params,
+            avg_seq_length=avg_seq_length,
+            multi_run_enabled=multi_run_enabled
+        )
+        print(f"  [Dev Split] Adaptive dev size: {dev_size} (dataset_size={dataset_size}, hours={hours_to_complete:.2f}, model_params={model_params/1e9 if model_params else None:.2f}B, seq_len={avg_seq_length}, multi_run={multi_run_enabled})", flush=True)
 
     split_dataset(
         total_path,
