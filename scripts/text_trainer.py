@@ -15,7 +15,7 @@ import uuid
 import re
 import time 
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Tuple
 
 import yaml
 from transformers import AutoTokenizer
@@ -139,6 +139,49 @@ def extract_output_dir(train_cmd: str) -> Optional[str]:
         return None
 
 
+def check_memory_before_training(batch_size: Optional[int] = None) -> Tuple[bool, str]:
+    """
+    Proactively check GPU memory availability before training starts.
+    
+    Args:
+        batch_size: Current batch size (optional, for recommendations)
+    
+    Returns:
+        Tuple of (is_safe, message)
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return True, "CUDA not available, skipping memory check"
+        
+        device = torch.cuda.current_device()
+        memory_allocated = torch.cuda.memory_allocated(device) / (1024**3)  # GB
+        memory_reserved = torch.cuda.memory_reserved(device) / (1024**3)  # GB
+        memory_total = torch.cuda.get_device_properties(device).total_memory / (1024**3)  # GB
+        memory_free = memory_total - memory_reserved
+        
+        usage_ratio = memory_reserved / memory_total
+        
+        message = f"GPU Memory: {memory_reserved:.2f}GB / {memory_total:.2f}GB reserved ({usage_ratio:.1%}), {memory_free:.2f}GB free"
+        
+        # Warn if memory usage is high
+        if usage_ratio > 0.85:
+            recommendation = ""
+            if batch_size and batch_size > 1:
+                recommended_batch = max(1, batch_size // 2)
+                recommendation = f" Consider reducing batch_size to {recommended_batch}"
+            return False, f"WARNING: {message}. High memory usage may cause OOM.{recommendation}"
+        elif usage_ratio > 0.70:
+            return True, f"CAUTION: {message}. Memory usage is moderate."
+        else:
+            return True, message
+            
+    except ImportError:
+        return True, "PyTorch not available, skipping memory check"
+    except Exception as e:
+        return True, f"Warning: Could not check memory: {e}"
+
+
 def run_training(
     train_cmd: str,
     log_path: str,
@@ -153,9 +196,20 @@ def run_training(
             torch.cuda.empty_cache()
             print(f"************* Clear GPU cache before starting training to avoid memory fragmentation *************", flush=True)
             
-    except:
-        print(f"************* GPU is not allowed *************", flush=True)    
-        pass
+            # Proactive memory check
+            batch_size = extract_value_from_cmd(train_cmd, "per_device_train_batch_size")
+            batch_size_int = int(batch_size) if batch_size else None
+            is_safe, mem_msg = check_memory_before_training(batch_size_int)
+            print(f"************* {mem_msg} *************", flush=True)
+            if not is_safe:
+                print(f"************* WARNING: High memory usage detected. Training may fail with OOM. *************", flush=True)
+        else:
+            print(f"************* CUDA not available, skipping GPU cache clearing *************", flush=True)
+    except ImportError:
+        print(f"************* PyTorch not available, skipping GPU cache clearing *************", flush=True)
+    except Exception as e:
+        print(f"************* Warning: Failed to clear GPU cache: {e} *************", flush=True)
+        # Continue anyway - this is not critical
     
     for i in range(retries):
         print(f"************* Training attempt {i+1}/{retries} for task {task_id}*************", flush=True)
@@ -224,8 +278,10 @@ def run_training(
                 import torch
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-            except:
-                pass
+            except ImportError:
+                pass  # PyTorch not available, skip
+            except Exception as e:
+                print(f"Warning: Failed to clear GPU cache after successful training: {e}", flush=True)
             return True
         time.sleep(5)
         # Clear GPU cache after failed attempt
@@ -233,8 +289,10 @@ def run_training(
             import torch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-        except:
-            pass
+        except ImportError:
+            pass  # PyTorch not available, skip
+        except Exception as e:
+            print(f"Warning: Failed to clear GPU cache after failed attempt: {e}", flush=True)
     return False
 
 
@@ -324,10 +382,63 @@ def _select_best_checkpoint(train_runs: list[dict]) -> tuple[int, float, str]:
         return index, selected_loss, "train_loss"
 
 
+def validate_checkpoint(checkpoint_dir: str) -> bool:
+    """
+    Validate that a checkpoint is loadable and not corrupted.
+    
+    Args:
+        checkpoint_dir: Path to checkpoint directory
+    
+    Returns:
+        True if checkpoint is valid, False otherwise
+    """
+    if not os.path.exists(checkpoint_dir):
+        return False
+    
+    # Check for essential files
+    essential_files = ["config.json", "training_args.bin"]
+    for file in essential_files:
+        if not os.path.exists(os.path.join(checkpoint_dir, file)):
+            print(f"Warning: Checkpoint {checkpoint_dir} missing {file}", flush=True)
+            return False
+    
+    # Check for model files (either pytorch_model.bin or model.safetensors)
+    has_model = (
+        os.path.exists(os.path.join(checkpoint_dir, "pytorch_model.bin")) or
+        os.path.exists(os.path.join(checkpoint_dir, "model.safetensors"))
+    )
+    
+    # Check for sharded model files
+    if not has_model:
+        try:
+            has_model = any(f.startswith("pytorch_model-") for f in os.listdir(checkpoint_dir))
+        except (OSError, PermissionError) as e:
+            print(f"Warning: Cannot list files in {checkpoint_dir}: {e}", flush=True)
+            # If we can't list, assume invalid
+            return False
+    
+    if not has_model:
+        print(f"Warning: Checkpoint {checkpoint_dir} missing model files", flush=True)
+        return False
+    
+    # Try to load config to verify it's not corrupted
+    try:
+        import json
+        config_path = os.path.join(checkpoint_dir, "config.json")
+        with open(config_path, 'r') as f:
+            json.load(f)
+    except Exception as e:
+        print(f"Warning: Checkpoint {checkpoint_dir} has corrupted config: {e}", flush=True)
+        return False
+    
+    return True
+
+
 def delete_poor_checkpoints(train_runs: list[dict]):
     """
     Delete checkpoints that are not the best.
     Uses eval_loss for comparison if available, otherwise uses current_loss.
+    Validates checkpoints before deletion to ensure we don't delete active ones.
     """
     if not train_runs:
         return
@@ -340,17 +451,33 @@ def delete_poor_checkpoints(train_runs: list[dict]):
         for run in train_runs:
             run_loss = run.get("current_eval_loss", run["current_loss"])
             if run_loss > lowest_loss:
-                if os.path.exists(run["output_dir"]):
-                    print(f"Deleting checkpoint {run['output_dir']} with eval_loss {run_loss:.6f} (train_loss: {run['current_loss']:.6f})", flush=True)
-                    shutil.rmtree(run["output_dir"])
+                checkpoint_dir = run.get("output_dir")
+                if checkpoint_dir and os.path.exists(checkpoint_dir):
+                    # Validate checkpoint before deletion
+                    if validate_checkpoint(checkpoint_dir):
+                        print(f"Deleting checkpoint {checkpoint_dir} with eval_loss {run_loss:.6f} (train_loss: {run['current_loss']:.6f})", flush=True)
+                        try:
+                            shutil.rmtree(checkpoint_dir)
+                        except Exception as e:
+                            print(f"Warning: Failed to delete checkpoint {checkpoint_dir}: {e}", flush=True)
+                    else:
+                        print(f"Warning: Skipping deletion of invalid checkpoint {checkpoint_dir}", flush=True)
     else:
         # Fallback to current_loss
         lowest_loss = min([run["current_loss"] for run in train_runs])
         for run in train_runs:
             if run["current_loss"] > lowest_loss:
-                if os.path.exists(run["output_dir"]):
-                    print(f"Deleting checkpoint {run['output_dir']} with loss {run['current_loss']}", flush=True)
-                    shutil.rmtree(run["output_dir"])
+                checkpoint_dir = run.get("output_dir")
+                if checkpoint_dir and os.path.exists(checkpoint_dir):
+                    # Validate checkpoint before deletion
+                    if validate_checkpoint(checkpoint_dir):
+                        print(f"Deleting checkpoint {checkpoint_dir} with loss {run['current_loss']}", flush=True)
+                        try:
+                            shutil.rmtree(checkpoint_dir)
+                        except Exception as e:
+                            print(f"Warning: Failed to delete checkpoint {checkpoint_dir}: {e}", flush=True)
+                    else:
+                        print(f"Warning: Skipping deletion of invalid checkpoint {checkpoint_dir}", flush=True)
 
 
 def get_log_scale(task_type: str):
@@ -676,7 +803,7 @@ def main():
         # scale learning rate proportionally, stop when speed improvement is small or validation accuracy drops
         "use_progressive_batch_size": True,
         "max_batch_size": 128,  # Maximum batch size for progressive scaling
-        "stability_steps": 50,  # Steps to confirm training stability before increasing batch size
+        "stability_steps": 10,  # Steps to confirm training stability before increasing batch size
     }
 
     if (args.task_type == TaskType.INSTRUCTTEXTTASK.value or args.task_type == TaskType.CHATTASK.value):
@@ -752,14 +879,19 @@ def main():
                         break
                     current_lr = float(state["train"]["lr"])
                     
-                    # Improved LR exploration: if we have previous run results, use them to guide exploration
-                    # Otherwise, use standard log-scale extension
+                    # Smart LR exploration: use previous run results to guide exploration
                     if "runs" in state and len(state.get("runs", [])) > 0:
-                        # We have previous results - could use them for smarter exploration
-                        # For now, use standard extension but could be enhanced
-                        state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
+                        # Use smart exploration with previous results
+                        print(f"Using smart LR exploration with {len(state['runs'])} previous runs", flush=True)
+                        state["lrs"] = lr_utils.smart_explore_learning_rates(
+                            current_lr, 
+                            state["runs"], 
+                            n_runs, 
+                            log_range=get_log_scale(args.task_type)
+                        )
                     else:
                         # First time: standard exploration
+                        print(f"Using standard LR exploration (no previous runs)", flush=True)
                         state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
                     
                     assert len(state["lrs"]) == n_runs, f"Number of learning rates {state['lrs']} should be equal to number of runs {n_runs}"

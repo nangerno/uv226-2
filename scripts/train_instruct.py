@@ -374,8 +374,8 @@ def main():
     
     try:
         model.config.use_cache = False
-    except:
-        pass
+    except Exception as e:
+        log_info(f"Warning: Failed to set use_cache=False: {e}")
     
     # some model need to set the generation config or encounter the invalid generation config error
     set_generation_config(train_request["model_name"], model)

@@ -1018,18 +1018,20 @@ def set_generation_config(model_name, model):
     try:
         if model_name in ERROR_GENERATION_CONFIG_MODELS:
             model.generation_config = GenerationConfig(temperature=None, top_p=None)
-    except:
-        print(f"Error setting generation config for model {model_name}")
-        pass
+    except Exception as e:
+        print(f"Error setting generation config for model {model_name}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
 
 
 def resize_if_needed(model_name, model, token_nums):
     try:
         if model_name in MIS_MATCH_VOCAB_SIZE_MODELS:
             model.resize_token_embeddings(token_nums)
-    except:
-        print(f"Error resizing token embeddings for model {model_name}")
-        pass
+    except Exception as e:
+        print(f"Error resizing token embeddings for model {model_name}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
 
 
 def init_wandb(train_request: Dict):
@@ -1076,21 +1078,34 @@ class ProgressiveBatchSizeCallback(TrainerCallback):
         self.last_step_time = None
         self.stable_training_confirmed = False
         self.scaling_active = False
+        self.trainer = None  # Will be set when trainer is available
+        self.last_batch_size_increase_step = None  # Track when we last increased batch size
+        
+        # Rollback tracking
+        self.previous_batch_size = None  # For rollback
+        self.previous_learning_rate = None  # For rollback
+        self.rollback_check_steps = 20  # Steps to monitor after batch size increase
+        self.steps_since_last_increase = 0
+        self.losses_after_increase = []  # Track losses after batch size increase
         
     def on_train_begin(self, args, state, control, **kwargs):
         """Initialize batch size scaling monitoring at training start"""
         if not is_main_process(LOCAL_RANK):
             return control
         
+        # Store trainer reference for dynamic batch size changes
+        self.trainer = kwargs.get('trainer', None)
+        
         # Note: Batch size should be set before trainer creation (done in training scripts)
-        # This callback monitors training and logs recommendations for batch size scaling
+        # This callback monitors training and automatically applies batch size scaling
         self.current_batch_size = args.per_device_train_batch_size
         self.base_learning_rate = args.learning_rate
         self.stability_check_start_step = state.global_step
         self.scaling_active = True
+        self.last_batch_size_increase_step = None
         
         print(f"ProgressiveBatchSize: Monitoring initialized with batch_size={self.current_batch_size}, lr={self.base_learning_rate}", flush=True)
-        print(f"ProgressiveBatchSize: Will monitor training stability and recommend batch size increases", flush=True)
+        print(f"ProgressiveBatchSize: Will monitor training stability and automatically increase batch size", flush=True)
         return control
     
     def _check_training_stability(self, state) -> bool:
@@ -1167,19 +1182,111 @@ class ProgressiveBatchSizeCallback(TrainerCallback):
         
         return False
     
+    def _should_rollback(self) -> bool:
+        """Check if batch size increase caused instability and should be rolled back"""
+        if len(self.losses_after_increase) < self.rollback_check_steps:
+            return False
+        
+        # Check if loss is increasing or NaN/Inf
+        recent_losses = self.losses_after_increase[-self.rollback_check_steps:]
+        
+        # Check for NaN or Inf
+        if any(not isinstance(l, float) or not (l == l) or not (abs(l) < float('inf')) for l in recent_losses):
+            print(f"ProgressiveBatchSize: ROLLBACK - Found NaN/Inf in losses after batch size increase", flush=True)
+            return True
+        
+        # Check if loss increased significantly (more than 20%)
+        if len(recent_losses) >= 2:
+            initial_loss = recent_losses[0]
+            current_loss = recent_losses[-1]
+            loss_increase = (current_loss - initial_loss) / initial_loss if initial_loss > 0 else float('inf')
+            
+            if loss_increase > 0.2:  # 20% increase threshold
+                print(f"ProgressiveBatchSize: ROLLBACK - Loss increased by {loss_increase:.2%} after batch size increase ({initial_loss:.6f} -> {current_loss:.6f})", flush=True)
+                return True
+        
+        return False
+    
+    def _rollback_batch_size(self, args, state):
+        """Rollback to previous batch size and learning rate"""
+        if self.previous_batch_size is None or self.previous_learning_rate is None:
+            print(f"ProgressiveBatchSize: ROLLBACK - Cannot rollback: no previous values stored", flush=True)
+            return
+        
+        print(f"ProgressiveBatchSize: ROLLBACK - Rolling back batch_size from {self.current_batch_size} to {self.previous_batch_size}", flush=True)
+        print(f"ProgressiveBatchSize: ROLLBACK - Rolling back learning_rate from {args.learning_rate:.8f} to {self.previous_learning_rate:.8f}", flush=True)
+        
+        try:
+            # Restore previous values
+            args.per_device_train_batch_size = self.previous_batch_size
+            args.learning_rate = self.previous_learning_rate
+            self.current_batch_size = self.previous_batch_size
+            self.base_learning_rate = self.previous_learning_rate
+            
+            # Clear dataloader cache
+            if self.trainer is not None:
+                if hasattr(self.trainer, '_train_dataloader'):
+                    delattr(self.trainer, '_train_dataloader')
+                if hasattr(self.trainer, '_eval_dataloader'):
+                    delattr(self.trainer, '_eval_dataloader')
+                
+                # Update optimizer
+                if hasattr(self.trainer, 'optimizer') and self.trainer.optimizer is not None:
+                    for param_group in self.trainer.optimizer.param_groups:
+                        param_group['lr'] = self.previous_learning_rate
+            
+            # Reset rollback tracking
+            self.previous_batch_size = None
+            self.previous_learning_rate = None
+            self.steps_since_last_increase = 0
+            self.losses_after_increase = []
+            
+            # Reset stability tracking
+            self.stability_check_start_step = state.global_step
+            self.last_batch_size_increase_step = None  # Reset so we can try again later
+            self.stable_training_confirmed = False
+            self.previous_losses = []
+            self.previous_speeds = []
+            
+            print(f"ProgressiveBatchSize: ROLLBACK - Successfully rolled back. Will wait for stability before trying again.", flush=True)
+            
+        except Exception as e:
+            print(f"ProgressiveBatchSize: ROLLBACK - ERROR - Failed to rollback: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+    
     def on_step_end(self, args, state, control, **kwargs):
         """Monitor training and adjust batch size"""
         if not is_main_process(LOCAL_RANK) or not self.scaling_active:
             return control
         
+        # Ensure we have trainer reference (fallback if not set in on_train_begin)
+        if self.trainer is None:
+            self.trainer = kwargs.get('trainer', None)
+        
         # Track training loss
         if state.log_history:
             last_log = state.log_history[-1]
             if "loss" in last_log:
-                self.previous_losses.append(last_log["loss"])
+                current_loss = last_log["loss"]
+                self.previous_losses.append(current_loss)
                 # Keep only recent losses for stability check
                 if len(self.previous_losses) > self.stability_steps * 2:
                     self.previous_losses = self.previous_losses[-self.stability_steps:]
+                
+                # Track losses after batch size increase for rollback check
+                if self.previous_batch_size is not None:
+                    self.steps_since_last_increase += 1
+                    self.losses_after_increase.append(current_loss)
+                    
+                    # Check if we need to rollback (training became unstable)
+                    if self.steps_since_last_increase >= self.rollback_check_steps:
+                        if self._should_rollback():
+                            self._rollback_batch_size(args, state)
+                            return control
+                        # Clear rollback tracking if stable
+                        if len(self.losses_after_increase) > self.rollback_check_steps * 2:
+                            self.losses_after_increase = self.losses_after_increase[-self.rollback_check_steps:]
         
         # Track training speed (steps per second)
         if self.last_step_time is not None:
@@ -1212,11 +1319,19 @@ class ProgressiveBatchSizeCallback(TrainerCallback):
                     print(f"ProgressiveBatchSize: Training not stable yet, waiting...", flush=True)
             return control
         
-        # Monitor and log recommendations for batch size increases
-        # Note: Actual batch size changes require restarting training with new parameters
+        # Automatically apply batch size increases when training is stable
         steps_since_last_check = state.global_step - self.stability_check_start_step
-        if steps_since_last_check >= self.stability_steps and self.current_batch_size < self.max_batch_size:
-            # Calculate recommended new batch size
+        # Also check if enough steps have passed since last increase (if any)
+        steps_since_last_increase = (
+            state.global_step - self.last_batch_size_increase_step 
+            if self.last_batch_size_increase_step is not None 
+            else steps_since_last_check
+        )
+        
+        if (steps_since_last_check >= self.stability_steps and 
+            steps_since_last_increase >= self.stability_steps and
+            self.current_batch_size < self.max_batch_size):
+            # Calculate new batch size
             new_batch_size = int(self.current_batch_size * self.batch_size_multiplier)
             new_batch_size = min(new_batch_size, self.max_batch_size)
             
@@ -1225,16 +1340,72 @@ class ProgressiveBatchSizeCallback(TrainerCallback):
                 lr_scale = new_batch_size / self.current_batch_size
                 new_learning_rate = self.base_learning_rate * lr_scale
                 
-                print(f"ProgressiveBatchSize: RECOMMENDATION - Training is stable, could increase batch size", flush=True)
+                print(f"ProgressiveBatchSize: AUTOMATIC - Training is stable, increasing batch size", flush=True)
                 print(f"ProgressiveBatchSize:   Current: batch_size={self.current_batch_size}, lr={args.learning_rate:.8f}", flush=True)
-                print(f"ProgressiveBatchSize:   Recommended: batch_size={new_batch_size}, lr={new_learning_rate:.8f} (scale={lr_scale:.2f})", flush=True)
-                print(f"ProgressiveBatchSize:   Note: To apply, restart training with these new parameters", flush=True)
+                print(f"ProgressiveBatchSize:   New: batch_size={new_batch_size}, lr={new_learning_rate:.8f} (scale={lr_scale:.2f})", flush=True)
                 
-                # Track that we've made a recommendation (for future auto-restart implementation)
-                self.stability_check_start_step = state.global_step
-                self.stable_training_confirmed = False  # Need to confirm stability again
-                self.previous_losses = []  # Reset for new stability check
-                self.previous_speeds = []  # Reset speed tracking
+                # Apply the changes automatically
+                try:
+                    # Update training arguments
+                    args.per_device_train_batch_size = new_batch_size
+                    args.learning_rate = new_learning_rate
+                    
+                    # Update our tracking
+                    old_batch_size = self.current_batch_size
+                    self.current_batch_size = new_batch_size
+                    self.base_learning_rate = new_learning_rate  # Update base LR for next scaling
+                    
+                    # Clear dataloader cache so trainer recreates it with new batch size
+                    if self.trainer is not None:
+                        # Clear the cached train dataloader
+                        if hasattr(self.trainer, '_train_dataloader'):
+                            delattr(self.trainer, '_train_dataloader')
+                        # Also clear eval dataloader cache if it exists
+                        if hasattr(self.trainer, '_eval_dataloader'):
+                            delattr(self.trainer, '_eval_dataloader')
+                        
+                        # Force recreation of dataloader with new batch size
+                        # This ensures the new batch size takes effect immediately
+                        try:
+                            if hasattr(self.trainer, 'get_train_dataloader'):
+                                # Force recreation by calling get_train_dataloader
+                                # This will use the updated args.per_device_train_batch_size
+                                _ = self.trainer.get_train_dataloader()
+                        except Exception as e:
+                            # If recreation fails, it will happen naturally on next access
+                            print(f"ProgressiveBatchSize: Note - Dataloader will be recreated on next access: {e}", flush=True)
+                        
+                        # Update learning rate in optimizer and scheduler
+                        if hasattr(self.trainer, 'optimizer') and self.trainer.optimizer is not None:
+                            for param_group in self.trainer.optimizer.param_groups:
+                                param_group['lr'] = new_learning_rate
+                        
+                        # Update scheduler if it exists
+                        if hasattr(self.trainer, 'lr_scheduler') and self.trainer.lr_scheduler is not None:
+                            # The scheduler will use the new learning rate from optimizer on next step
+                            pass
+                    
+                    print(f"ProgressiveBatchSize:   Successfully updated batch_size from {old_batch_size} to {new_batch_size}", flush=True)
+                    print(f"ProgressiveBatchSize:   Learning rate updated to {new_learning_rate:.8f}", flush=True)
+                    
+                    # Store previous values for potential rollback
+                    self.previous_batch_size = old_batch_size
+                    self.previous_learning_rate = args.learning_rate  # Store old LR before update
+                    self.steps_since_last_increase = 0
+                    self.losses_after_increase = []  # Track losses after increase
+                    
+                    # Reset stability tracking for next increase
+                    self.stability_check_start_step = state.global_step
+                    self.last_batch_size_increase_step = state.global_step
+                    self.stable_training_confirmed = False  # Need to confirm stability again
+                    self.previous_losses = []  # Reset for new stability check
+                    self.previous_speeds = []  # Reset speed tracking
+                    
+                except Exception as e:
+                    print(f"ProgressiveBatchSize: ERROR - Failed to apply batch size increase: {e}", flush=True)
+                    import traceback
+                    traceback.print_exc()
+                    # Don't reset tracking on error, so we can retry
         
         return control
     
