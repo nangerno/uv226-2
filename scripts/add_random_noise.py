@@ -24,7 +24,7 @@ def main(model_path: str, save_folder: str, noise_std: float = 0.01):
         noise_magnitude = torch.norm(noise).item()
         weight_magnitude = torch.norm(embeddings.weight).item()
         relative_change = (noise_magnitude / weight_magnitude) * 100 if weight_magnitude > 0 else 0
-        print(f"  Noise magnitude: {noise_magnitude:.6f}, Weight magnitude: {weight_magnitude:.6f}, Relative change: {relative_change:.4f}%", flush=True)
+        print(f"Noise magnitude: {noise_magnitude:.6f}, Weight magnitude: {weight_magnitude:.6f}, Relative change: {relative_change:.4f}%", flush=True)
 
     # Step 3: Save the modified model and tokenizer
     print(f"Saving modified model to {save_folder}...", flush=True)
