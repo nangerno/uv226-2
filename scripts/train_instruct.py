@@ -237,27 +237,28 @@ def main():
     # OPTIMIZATION: More conservative batch-size cap for long sequence lengths to reduce OOM retries.
     # This is much faster than crashing multiple times and halving repeatedly.
     # Made more conservative based on log analysis showing repeated OOM errors.
+    # Store the cap for later use in OOM recovery
+    batch_size_cap = None
     if train_request.get("adjust_batch_size", True):
-        cap = None
         if max_length >= 2048:
-            # Very long sequences: very conservative caps
-            cap = 6 if not training_args.use_lora else 12
+            # Very long sequences: very conservative caps (reduced from 6/12 to 4/8 based on OOM logs)
+            batch_size_cap = 4 if not training_args.use_lora else 8
         elif max_length >= 1536:
             # Long sequences: conservative caps
-            cap = 10 if not training_args.use_lora else 20
+            batch_size_cap = 8 if not training_args.use_lora else 16
         elif max_length >= 1024:
             # Medium-long sequences: moderate caps
-            cap = 20 if not training_args.use_lora else 40
+            batch_size_cap = 16 if not training_args.use_lora else 32
         elif max_length >= 512:
             # Medium sequences: slightly conservative caps
-            cap = 40 if not training_args.use_lora else 80
+            batch_size_cap = 32 if not training_args.use_lora else 64
         
-        if cap is not None and training_args.per_device_train_batch_size > cap:
+        if batch_size_cap is not None and training_args.per_device_train_batch_size > batch_size_cap:
             log_info(
-                f"[Batch Size Cap] Capping per_device_train_batch_size from {training_args.per_device_train_batch_size} to {cap} "
+                f"[Batch Size Cap] Capping per_device_train_batch_size from {training_args.per_device_train_batch_size} to {batch_size_cap} "
                 f"(max_length={max_length}, use_lora={training_args.use_lora}) to avoid OOM"
             )
-            training_args.per_device_train_batch_size = cap
+            training_args.per_device_train_batch_size = batch_size_cap
 
     # we already tokenize the data and save it to train_tokenized.json and dev_tokenized.json
     train_ds = MyDataset(
@@ -358,6 +359,22 @@ def main():
                 * training_args.world_size
             )
             log_info(f"updated total_steps_per_epoch: {total_steps_per_epoch}")
+    
+    # CRITICAL: Re-apply batch size cap after all adjustments to ensure it's respected
+    # This prevents OOM errors from sequences that are too long
+    if batch_size_cap is not None and training_args.per_device_train_batch_size > batch_size_cap:
+        log_info(
+            f"[Batch Size Cap] Re-applying cap: reducing per_device_train_batch_size from {training_args.per_device_train_batch_size} to {batch_size_cap} "
+            f"(max_length={max_length}, use_lora={training_args.use_lora}) to avoid OOM"
+        )
+        training_args.per_device_train_batch_size = batch_size_cap
+        # Recalculate total_steps_per_epoch after final cap
+        total_steps_per_epoch = len(train_ds) // (
+            training_args.per_device_train_batch_size
+            * training_args.gradient_accumulation_steps
+            * training_args.world_size
+        )
+        log_info(f"updated total_steps_per_epoch after cap: {total_steps_per_epoch}")
 
     if training_args.use_lora:
         model = load_lora_model(training_args, train_request["model_path"], lora_args, len(tokenizer))
@@ -467,6 +484,31 @@ def main():
     )
 
     trainer.tokenizer = tokenizer
+    
+    # CRITICAL: Aggressive memory cleanup before training to avoid fragmentation and OOM errors
+    try:
+        import gc
+        if torch.cuda.is_available():
+            # Python garbage collection first
+            gc.collect()
+            # Clear PyTorch CUDA cache
+            torch.cuda.empty_cache()
+            # Synchronize to ensure all operations complete
+            torch.cuda.synchronize()
+            # Reset peak memory stats for better tracking
+            torch.cuda.reset_peak_memory_stats()
+            
+            # Log memory status for diagnostics
+            if torch.cuda.device_count() > 0:
+                allocated = torch.cuda.memory_allocated(0) / 1024**3  # GB
+                reserved = torch.cuda.memory_reserved(0) / 1024**3  # GB
+                total = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
+                log_info(f"************* GPU Memory Status Before Training *************")
+                log_info(f"  GPU 0: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, {total:.2f}GB total")
+                log_info(f"  Available: {total - reserved:.2f}GB")
+    except Exception as e:
+        log_info(f"Warning: Could not perform GPU memory cleanup: {e}")
+    
     # Automatically resume from last checkpoint if one exists
     last_checkpoint = get_last_checkpoint(training_args.output_dir)
     if last_checkpoint:

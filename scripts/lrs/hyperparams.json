@@ -1,0 +1,11 @@
+[
+    {
+        "h": "8a12343a27e43c9d73eb9a698de51376c2469f8eb9b21f7c36535302f40e499b",
+        "model": "test-model",
+        "task_type": "instruct",
+        "param_nums": 1000000,
+        "timestamp": "2026-03-15T16:07:16.364006+00:00",
+        "eval_loss": 0.5,
+        "train_loss": 0.6
+    }
+]

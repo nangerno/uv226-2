@@ -264,6 +264,46 @@ def run_training(
                             flush=True,
                         )
                     elif current_batch_size > 1:
+                        # CRITICAL: Get max_length from training request to apply proper batch size caps
+                        # This prevents OOM errors from sequences that are too long
+                        max_length = None
+                        batch_size_cap = None
+                        use_lora = extract_value_from_cmd(train_cmd, "use_lora")
+                        use_lora = use_lora == "True" if use_lora else False
+                        
+                        # Try to extract request_path from command and read max_length
+                        request_path = extract_value_from_cmd(train_cmd, "request_path")
+                        if request_path and os.path.exists(request_path):
+                            try:
+                                with open(request_path, "r") as f:
+                                    train_info = json.load(f)
+                                    train_request = train_info.get("train_request", {})
+                                    max_length = train_request.get("max_length")
+                                    if max_length is None:
+                                        # Try to get from test_axolotl.yml as fallback
+                                        try:
+                                            import yaml
+                                            config_path = "test_axolotl.yml"
+                                            if os.path.exists(config_path):
+                                                with open(config_path, "r") as cfg_file:
+                                                    config_dict = yaml.safe_load(cfg_file)
+                                                    max_length = config_dict.get("sequence_len")
+                                        except:
+                                            pass
+                            except Exception as e:
+                                print(f"  [OOM Recovery] Could not read max_length from request: {e}", flush=True)
+                        
+                        # Apply batch size caps based on max_length (same logic as train_instruct.py)
+                        if max_length is not None:
+                            if max_length >= 2048:
+                                batch_size_cap = 4 if not use_lora else 8
+                            elif max_length >= 1536:
+                                batch_size_cap = 8 if not use_lora else 16
+                            elif max_length >= 1024:
+                                batch_size_cap = 16 if not use_lora else 32
+                            elif max_length >= 512:
+                                batch_size_cap = 32 if not use_lora else 64
+                        
                         # OPTIMIZATION: Smarter batch size reduction based on retry count
                         # First retry: reduce by 50%, subsequent retries: reduce by 40% (more conservative)
                         if i == 1:
@@ -277,6 +317,16 @@ def run_training(
                             reduction_factor = 0.7
                         
                         new_batch_size = max(1, int(current_batch_size * reduction_factor))
+                        
+                        # CRITICAL: Apply batch size cap if max_length-based cap is more restrictive
+                        if batch_size_cap is not None and new_batch_size > batch_size_cap:
+                            print(
+                                f"  [OOM Recovery] Applying max_length-based cap: reducing batch size from {new_batch_size} to {batch_size_cap} "
+                                f"(max_length={max_length}, use_lora={use_lora})",
+                                flush=True,
+                            )
+                            new_batch_size = batch_size_cap
+                        
                         print(
                             f"  [OOM Recovery] Reducing batch size from {current_batch_size} to {new_batch_size} "
                             f"(retry {i+1}/{retries}, reduction: {int((1-reduction_factor)*100)}%)",
@@ -1150,7 +1200,7 @@ def main():
                 )
 
                 base_log_range = get_log_scale(args.task_type)
-                print(f"  [LR Search] Adaptive log_range: {adaptive_log_range:.4f} (base: {base_log_range:.4f}, model_params={model_params/1e9 if model_params else None:.2f}B, dataset_size={dataset_size}, n_runs={n_runs}, hours={args.hours_to_complete:.2f})", flush=True)
+                print(f"  [LR Search] Adaptive log_range: {adaptive_log_range:.4f} (base: {base_log_range:.4f}, model_params={f'{model_params/1e9:.2f}B' if model_params else 'None'}, dataset_size={dataset_size}, n_runs={n_runs}, hours={args.hours_to_complete:.2f})", flush=True)
 
                 state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=adaptive_log_range)
                 assert len(state["lrs"]) == n_runs, f"Number of learning rates {state['lrs']} should be equal to number of runs {n_runs}"

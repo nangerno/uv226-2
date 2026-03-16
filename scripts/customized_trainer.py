@@ -474,9 +474,9 @@ class CustomEvalSaveCallback(TrainerCallback):
                                     break
                         if train_reward_for_storage is not None:
                             my_state["train"]["current_train_reward"] = train_reward_for_storage
-                        print(f"CRITICAL: [GRPO] Stored eval_reward {-eval_loss:.6f} and train_reward {train_reward_for_storage:.6f if train_reward_for_storage else None} at checking_step {state.global_step} for multi-run selection", flush=True)
+                        print(f"CRITICAL: [GRPO] Stored eval_reward {-eval_loss:.6f} and train_reward {f'{train_reward_for_storage:.6f}' if train_reward_for_storage is not None else 'None'} at checking_step {state.global_step} for multi-run selection", flush=True)
                     else:
-                        print(f"CRITICAL: Stored eval_loss {eval_loss:.6f} and train_loss {train_loss_for_storage:.6f if train_loss_for_storage else None} at checking_step {state.global_step} for multi-run selection", flush=True)
+                        print(f"CRITICAL: Stored eval_loss {eval_loss:.6f} and train_loss {f'{train_loss_for_storage:.6f}' if train_loss_for_storage is not None else 'None'} at checking_step {state.global_step} for multi-run selection", flush=True)
                     
                     # Now make decision based on eval_loss instead of train_loss
                     current_is_the_best = False
@@ -1030,6 +1030,12 @@ class CustomEvalSaveCallback(TrainerCallback):
             if updated:
                 print(f"  [LR Update] Successfully updated LR lookup table for {self.original_model_name[:50]}...", flush=True)
                 print(f"  [LR Update]   - LR: {learning_rate:.8f}", flush=True)
+                if final_eval_loss:
+                    print(f"  [LR Update]   - Eval Loss: {final_eval_loss:.6f}", flush=True)
+                if final_train_loss:
+                    print(f"  [LR Update]   - Train Loss: {final_train_loss:.6f}", flush=True)
+            else:
+                print(f"  [LR Update] Lookup table not updated (existing entry has better or equal loss)", flush=True)
             
             # AutoML: Also update hyperparameter lookup table
             try:
@@ -1047,12 +1053,6 @@ class CustomEvalSaveCallback(TrainerCallback):
                 )
             except Exception as e:
                 print(f"  [AutoML] Warning: Could not update hyperparameter lookup: {e}", flush=True)
-                if final_eval_loss:
-                    print(f"  [LR Update]   - Eval Loss: {final_eval_loss:.6f}", flush=True)
-                if final_train_loss:
-                    print(f"  [LR Update]   - Train Loss: {final_train_loss:.6f}", flush=True)
-            else:
-                print(f"  [LR Update] Lookup table not updated (existing entry has better or equal loss)", flush=True)
         except Exception as e:
             print(f"  [LR Update] Error updating LR lookup table: {e}", flush=True)
             import traceback
